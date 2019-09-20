@@ -1,0 +1,1654 @@
+<?xml version="1.0" encoding="UTF-8"?><rss xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom" version="2.0">
+    <channel>
+        <title><![CDATA[一叶斋]]></title>
+        <description><![CDATA[一叶障目 一叶知秋]]></description>
+        <link>http://xieguanglei.github.io/</link>
+        <generator>RSS for Node</generator>
+        <lastBuildDate>Fri, 20 Sep 2019 13:24:57 GMT</lastBuildDate>
+        <atom:link href="http://xieguanglei.github.io/blog/feed.xml" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[Flutter Framework 源码解析（ 2 ）—— 图层详解]]></title>
+            <description><![CDATA[<h1 id="flutter-framework-源码解析（-2-）-图层详解">Flutter Framework 源码解析（ 2 ）—— 图层详解</h1>
+<p>书接上回，我们讲到了 Flutter Engine 绘图引擎（简称 Engine）的基本用法。这一篇，我们就来讲讲 Flutter 中的一个直接建立在 Engine 上的，非常基础的概念，也就是图层（Layer）。</p>
+<p>图层是绘图操作的载体，也可以缓存绘图操作的结果。图层允许我们分别在不同的图层上绘图，然后将这些缓存了绘图结果的图层按照规则进行叠加，得到最终的渲染结果（图像）。每个图层都有相对独立的绘图上下文以及不同的绘图频率，一些本不必频繁绘制的图层就可以不用频繁绘制（还是那个常见的例子：拖动中的软件窗体），一些全局的效果也可以直接作用于绘图的结果而不必单独作用于绘图中的每一步（最常见的是位移、半透明、裁剪）。</p>
+<h2 id="最简单的例子">最简单的例子</h2>
+<p>Flutter Framework 中定义了若干个图层类，结合上一节介绍的 Engine，即可以进行一些简单的绘图。先看一个最简单的例子。</p>
+<pre><code class="language-dart"><span class="hljs-keyword">import</span> <span class="hljs-string">'dart:ui'</span>;
+<span class="hljs-keyword">import</span> <span class="hljs-string">'package:flutter/rendering.dart'</span>;
+
+<span class="hljs-keyword">void</span> main(){
+
+  OffsetLayer rootLayer = <span class="hljs-keyword">new</span> OffsetLayer();
+  PictureLayer pictureLayer = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  rootLayer.append(pictureLayer);
+
+  pictureLayer.picture = createSolidRectanglePicture(
+    Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>
+  );
+
+  rootLayer.updateSubtreeNeedsAddToScene();
+
+  SceneBuilder sceneBuilder = SceneBuilder();
+  rootLayer.addToScene(sceneBuilder);
+
+  Scene scene = sceneBuilder.build();
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+    <span class="hljs-built_in">window</span>.render(scene);
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}
+
+
+Picture createSolidRectanglePicture(
+  Color color, <span class="hljs-built_in">double</span> width, <span class="hljs-built_in">double</span> height)
+{
+
+  PictureRecorder recorder = PictureRecorder();
+  Canvas canvas = Canvas(recorder);
+
+  Paint paint = Paint();
+  paint.color = color;
+
+  canvas.drawRect(Rect.fromLTWH(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>, width, height), paint);
+  <span class="hljs-keyword">return</span> recorder.endRecording();
+}</code></pre>
+<p>渲染结果如下图所示：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1iR.Te8v0gK0jSZKbXXbK2FXa-400-444.png" alt="最简单的例子渲染结果"><figurecaption>最简单的例子渲染结果</figcaption></figure></p>
+<p>这个例子首先创建了一个 <code>PictureLayer</code> 类的实例和一个 <code>OffsetLayer</code> 类的实例（这两个类定义在 <code>package:flutter/rendering.dart</code> 中，其含义稍后解释），并将 <code>pictureLayer</code> 作为子节点（如上一篇所述，Layer 通过树状结构来组织）添加到名为 <code>rootLayer</code> 的 <code>OffsetLayer</code> 对象中。</p>
+<p>接下来，使用 <code>PictureRecorder</code> 和 <code>Canvas</code> 绘制一个红色的、尺寸为 300 x 300 的矩形，并取得 <code>Picture</code> 类的实例 <code>picture</code>。<code>PictureRecorder</code> 和 <code>Canvas</code> 都是 Engine 层暴露给 Dart 层的接口，如果你看过本系列文章的前一篇，对它们的用法应该不陌生。本篇文章中，我把创建 <code>Picture</code> 的过程封装在 <code>createSolidRectanglePicture()</code> 方法中以便重用。</p>
+<p>第三步，将 <code>picture</code> 赋值给 <code>pictureLayer</code> 的同名属性。这很重要，这也是前一篇文章中关于创建 <code>Picture</code> 实例的代码，和本篇文章中创建 <code>Layer</code> 的代码连接起来的地方。</p>
+<p>然后，在 <code>rootLayer</code> 上调用 <code>updateSubtreeNeedsAddToScene()</code> 方法。这将对以 <code>rootLayer</code> 为根节点的 <code>Layer</code> 树进行一些状态更新（详情在本篇文章后半部分介绍）。</p>
+<p>然后，创建 <code>SceneBuilder</code> 实例（与前一篇中所做的一样），并在 <code>rootLayer</code> 上调用 <code>addToScene()</code> 方法，传入 <code>SceneBuilder</code> 实例。<code>addToScene()</code> 方法做的事情，就在 <code>sceneBuilder</code> 上进行 push（Offser、Opacity 等）、pop 和 add（Picture 等）操作。在这个例子中，相当于：</p>
+<pre><code class="language-dart"><span class="hljs-comment">// rootLayer.addToScene(sceneBuilder) 相当于：</span>
+
+<span class="hljs-comment">// 接下来这几行代码，读过前一篇文章后，应当很熟悉了</span>
+sceneBuilder.pushOffset(Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>));
+sceneBuilder.addPicture(picture);
+sceneBuilder.pop();</code></pre>
+<p>最后，在 <code>SceneBuilder</code> 对象上调用 <code>build()</code> 方法，构建出 <code>Scene</code> 对象，最终渲染出来。这些步骤与前一篇中直接使用 Engine 绘图是完全一致的。 </p>
+<p>所以，这个例子中最重要的两步是：</p>
+<ol>
+<li>以 <code>rootLayer</code> 为根的 Layer 树的创建。</li>
+<li>调用 <code>addToScene()</code> 方法，遍历 Layer 树，操作 <code>sceneBuilder</code> 以反映 Layer 节点之间的关系。</li>
+</ol>
+<p>这个例子中，Layer 树的节点只有两个，类型为 <code>OffserLayer</code> 的根节点 <code>rootLayer</code> （对应 <code>sceneBuilder</code> 上的操作是 <code>pushOffset</code> 和 <code>pop</code>），和类型为 <code>PictureLayer</code> 的叶子节点 <code>pictureLayer</code>（对应 <code>sceneBuilder</code> 上的操作是 <code>addPicture</code>）：如下图所示：</p>
+<p><figure><img src="http://gw.alicdn.com/tfs/TB1tbzwe2b2gK0jSZK9XXaEgFXa-278-354.png" alt="最简单的例子"><figurecaption>最简单的例子</figcaption></figure></p>
+<h2 id="常用的-layer-类">常用的 Layer 类</h2>
+<p>所有的 Layer 类（刚刚我们已经见识过了 <code>OffsetLayer</code> 和 <code>PictureLayer</code>）全部派生自 <code>Layer</code> 基类（这些类全部实现在 <code>rendering/layer.dart</code> 文件中）。具体的 Layer 类又分为两种：一种是具有一个或多个子节点的 Layer，它们继承自 <code>ContainerLayer</code>，另一种是不具有子节点的 Layer（叶子节点），它们直接继承自 <code>Layer</code>；如下图所示：</p>
+<p><figure><img src="http://gw.alicdn.com/tfs/TB1x.DxeYr1gK0jSZFDXXb9yVXa-664-358.png" alt="Layer 继承关系（常用 Layer）"><figurecaption>Layer 继承关系（常用 Layer）</figcaption></figure></p>
+<p>常用的具有子节点的 Layer 有三类：半透明（<code>OpacityLayer</code>）、位移（<code>OffsetLayer</code>、<code>TransformLayer</code>）和裁剪（<code>ClipRectLayer</code>、<code>ClipRRectLayer</code> 和 <code>ClipPathLayer</code>）。半透明、位移和裁剪这三个操作的目标，是所有子节点渲染结果叠加得到的<strong>像素数据</strong>，只有这种级别的操作，才值得添加一种 <code>ContainerLayer</code> 来对应。</p>
+<p>常用的不具有子节点的 Layer（叶子节点）包括：<code>PictureLayer</code> 和 <code>TextureLayer</code>。基于 <code>PictureRecorder</code> 的绘图操作全部由 <code>PictureLayer</code> 承载，它也是最最常用的叶子节点；而 <code>TextureLayer</code> 对应视频流、摄像头、OpenGL API 绘图等场景。本篇仅以 <code>PictureLayer</code> 为例来展开讲解叶子节点 Layer 的概念。</p>
+<p>下面先简单地过一遍几种不同的 <code>ContainerLayer</code>。</p>
+<h3 id="offset-layer-与-transform-layer">Offset Layer 与 Transform Layer</h3>
+<p>通常，根节点是位移值为 (0,0) 的 <code>OffsetLayer</code>。我们可以在 OffsetLayer 下再增加一层位移不为 (0,0) 的 <code>OffsetLayer</code>，使子树的位置发生变化。</p>
+<p><code>TransformLayer</code> 是一种更「自由」的位移操作层，不仅可以使其平移，也可使其旋转和缩放。看下面这个例子：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">void</span> main(){
+
+  OffsetLayer root = createLayerTree();
+
+  root.updateSubtreeNeedsAddToScene();
+
+  SceneBuilder sceneBuilder = SceneBuilder();
+  root.addToScene(sceneBuilder);
+  Scene scene = sceneBuilder.build();
+
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+    <span class="hljs-built_in">window</span>.render(scene);
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}
+
+OffsetLayer createLayerTree(){
+
+  OffsetLayer root = <span class="hljs-keyword">new</span> OffsetLayer();
+
+  OffsetLayer offsetParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>));
+  PictureLayer offsetLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer transformParent = <span class="hljs-keyword">new</span> TransformLayer(
+    transform: Matrix4.rotationZ(<span class="hljs-number">3.14</span>*<span class="hljs-number">0.25</span>), offset: Offset(<span class="hljs-number">400</span>, <span class="hljs-number">400</span>)
+  );
+  PictureLayer transformLeafGreen = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  PictureLayer transformLeafBlue = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+
+  root.append(offsetParent);
+  root.append(transformParent);
+  offsetParent.append(offsetLeaf);
+  transformParent.append(transformLeafGreen);
+  transformParent.append(transformLeafBlue);
+
+  offsetLeaf.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>);
+  transformLeafGreen.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFF00FF00</span>), <span class="hljs-number">500</span>, <span class="hljs-number">500</span>);
+  transformLeafBlue.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFF0000FF</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>);
+
+  <span class="hljs-keyword">return</span> root;
+}</code></pre>
+<p>从这个例子开始，我把创建的 Layer 树过程封装在了 <code>createLayerTree()</code> 方法中。<code>main()</code> 函数主动调用此方法获取 Layer 树的根节点并渲染（与前一个例子一致）。<code>createLayerTree()</code> 方法创建的 Layer 树如下所示：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1tunKe.H1gK0jSZSyXXXtlpXa-537-361.png" alt="图 OffsetLayer 与 TransformLayer"><figurecaption>图 OffsetLayer 与 TransformLayer</figcaption></figure></p>
+<p>渲染结果如下所示：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1pJMTe.H1gK0jSZSyXXXtlpXa-400-444.png" alt="位移图层渲染结果"><figurecaption>位移图层渲染结果</figcaption></figure></p>
+<p>创建 <code>OffsetLayer</code> 对象时可传入 <code>Offset</code> 对象以指定位移的偏移量。创建 <code>TransformLayer</code> 对象时需传入矩阵 <code>transform</code> 来描述具体的变换，这里用了沿 Z 轴（与屏幕垂直的轴）旋转 45°，因此渲染结果上，以 <code>transformParent</code> 为根的子树沿着左上角顺时针旋转了 45°，如果选择沿 X 或 Y 轴旋转，子树会变被水平压扁或垂直压扁，这是正射投影的结果（因为 X 轴和 Y 轴在屏幕内，而我们是平行于 Z 轴看屏幕的）。</p>
+<p>在渲染这一棵 Layer 树的时候，会按照深度优先的顺序进行遍历，对 <code>sceneBuilder</code> 进行与 Layer 节点类型对应的操作（比如，如果是 <code>OffsetLayer</code>，就 <code>pushOffset</code>，如果是 <code>PictureLayer</code>，就 <code>addPicture</code>）。对上图中的 Layer 树，对 <code>sceneBuilder</code> 的操作如下：</p>
+<ol>
+<li><code>pushOffset</code>：对应进入 <code>root</code>。</li>
+<li><code>pushOffset</code>：对应进入 <code>offsetParent</code>。</li>
+<li><code>addPicture</code>：对应 <code>offsetLeaf</code>。</li>
+<li><code>pop</code>：对应离开 <code>offsetParent</code>。</li>
+<li><code>pushTransform</code>：对应进入 <code>transformParent</code>。</li>
+<li><code>addPicture</code>：对应 <code>transformLeafGreen</code>。</li>
+<li><code>addPicture</code>：对应 <code>transformLeafBlue</code>。</li>
+<li><code>pop</code>：对应离开 <code>transformParent</code>。</li>
+<li><code>pop</code>：对应离开 <code>root</code>。</li>
+</ol>
+<p>（我猜想）对 Engine 来说，这些操作会形成一个操作队列，最后绘图引擎根据这个队列来绘图。在没有进一步优化的情况（本篇后半部分详细讲解）下，每一次屏幕刷新，都会重新根据 Layer 树来生成新的队列和绘制。</p>
+<p>接下来看看半透明图层。</p>
+<h3 id="opacity-layer">Opacity Layer</h3>
+<p><code>OffsetLayer</code> 对子树的全局操作是<strong>位移</strong>，而 <code>OpacityLayer</code>，顾名思义，对子树的全局操作是<strong>半透明</strong>。简单地看一下用法。</p>
+<pre><code class="language-dart">OffsetLayer createLayerTree(){
+
+  OffsetLayer root = <span class="hljs-keyword">new</span> OffsetLayer();
+
+  OffsetLayer backgroundParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">200</span>, <span class="hljs-number">200</span>));
+  PictureLayer backgroundLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer foregroundParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>));
+  OpacityLayer opacityParent = <span class="hljs-keyword">new</span> OpacityLayer(alpha: <span class="hljs-number">128</span>);
+  PictureLayer foregroundLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+
+  root.append(backgroundParent);
+  backgroundParent.append(backgroundLeaf);
+  root.append(foregroundParent);
+  foregroundParent.append(opacityParent);
+  opacityParent.append(foregroundLeaf);
+
+  backgroundLeaf.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>);
+  foregroundLeaf.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFF00FF00</span>), <span class="hljs-number">500</span>, <span class="hljs-number">500</span>);
+
+  <span class="hljs-keyword">return</span> root;
+}</code></pre>
+<p>在这个例子中，<code>createLayerTree()</code> 方法创建的子树如下图所示。创建 <code>OpacityLayer</code> 对象时，传入整型的 <code>alpha</code> 参数，128 表示半透明。</p>
+<p><figure><img src="http://gw.alicdn.com/tfs/TB1.ovTeYY1gK0jSZTEXXXDQVXa-364-511.png" alt="OpacityLayer"><figurecaption>OpacityLayer</figcaption></figure></p>
+<p>渲染结果如下所示。由于 <code>foregroundParent</code> 是 <code>root</code> 的第二个子节点（根据 <code>append</code> 顺序），在 <code>backgroundParent</code> 子树之后进行渲染，所以可以透过绿色的前景矩形看到红色的背景矩形。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1wesVe7L0gK0jSZFxXXXWHVXa-400-444.png" alt="半透明图层渲染结果"><figurecaption>半透明图层渲染结果</figcaption></figure></p>
+<p>接下来看裁剪图层。</p>
+<h3 id="cliprect-layer、cliprrect-layer-和-clippath-layer">ClipRect Layer、ClipRRect Layer 和 ClipPath Layer</h3>
+<p>裁剪图层有三种，它们的工作原理是类似的，都是对子树的渲染结果进行<strong>裁剪</strong>。</p>
+<ul>
+<li><code>ClipRectLayer</code>：裁剪出一个矩形。</li>
+<li><code>ClipRRectLayer</code>：裁剪出一个圆角矩形。</li>
+<li><code>ClipPathLayer</code>：裁剪出任意路径描述的多边形。</li>
+</ul>
+<p>看下面这个示例程序：</p>
+<pre><code class="language-dart">OffsetLayer createLayerTree(){
+
+  OffsetLayer root = <span class="hljs-keyword">new</span> OffsetLayer();
+  OffsetLayer noClipParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">200</span>, <span class="hljs-number">200</span>));
+  PictureLayer noClipLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer clipRectParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">500</span>, <span class="hljs-number">200</span>));
+  ClipRectLayer clipRect = 
+    <span class="hljs-keyword">new</span> ClipRectLayer(clipRect: Rect.fromLTWH(<span class="hljs-number">20</span>, <span class="hljs-number">20</span>, <span class="hljs-number">160</span>, <span class="hljs-number">160</span>));
+  PictureLayer clipRectLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer clipRRectParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">200</span>, <span class="hljs-number">600</span>));
+  ClipRRectLayer clipRRect = <span class="hljs-keyword">new</span> ClipRRectLayer(
+    clipRRect: RRect.fromLTRBR(<span class="hljs-number">20</span>, <span class="hljs-number">20</span>, <span class="hljs-number">160</span>, <span class="hljs-number">160</span>, Radius.circular(<span class="hljs-number">20</span>))
+  );
+  PictureLayer clipRRectLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer clipPathParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">500</span>, <span class="hljs-number">600</span>));
+  ClipPathLayer clipPath = <span class="hljs-keyword">new</span> ClipPathLayer(clipPath: createPath());
+  PictureLayer clipPathLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+
+  root.append(noClipParent);
+  noClipParent.append(noClipLeaf);
+  root.append(clipRectParent);
+  clipRectParent.append(clipRect);
+  clipRect.append(clipRectLeaf);
+  root.append(clipRRectParent);
+  clipRRectParent.append(clipRRect);
+  clipRRect.append(clipRRectLeaf);
+  root.append(clipPathParent);
+  clipPathParent.append(clipPath);
+  clipPath.append(clipPathLeaf);
+
+  noClipLeaf.picture = 
+    createSolidRectanglePicture(Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">200</span>, <span class="hljs-number">200</span>);
+  clipRectLeaf.picture = noClipLeaf.picture;
+  clipRRectLeaf.picture = noClipLeaf.picture;
+  clipPathLeaf.picture = noClipLeaf.picture;
+
+  <span class="hljs-keyword">return</span> root;
+}
+
+Path createPath(){
+  Path p = <span class="hljs-keyword">new</span> Path();
+  p.moveTo(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>);
+  p.lineTo(<span class="hljs-number">200</span>, <span class="hljs-number">0</span>);
+  p.lineTo(<span class="hljs-number">0</span>, <span class="hljs-number">200</span>);
+  p.close();
+  p.moveTo(<span class="hljs-number">100</span>, <span class="hljs-number">100</span>);
+  p.lineTo(<span class="hljs-number">200</span>, <span class="hljs-number">100</span>);
+  p.lineTo(<span class="hljs-number">100</span>, <span class="hljs-number">200</span>);
+  p.close();
+  <span class="hljs-keyword">return</span> p;
+}</code></pre>
+<p>子树的结构就不再画出来，感兴趣的读者可以自己画画看。<code>root</code> 的第一个子树 <code>noClipParent</code> 是没有切割的一块矩形，第二个子树 <code>clipRectParent</code> 被切割成了较小的矩形，第三个子树 <code>clipRRectParent</code> 被切割成了较小的圆角矩形，最后一个子树 <code>clipPathParent</code> 被切割成了两个三角形：这个三角形由 <code>createPath()</code> 方法定义（Path 上的方法很多，你可以任意创建各种圆弧、曲线等等）。</p>
+<p>渲染结果如下所示：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB172AUe4n1gK0jSZKPXXXvUXXa-400-444.png" alt="裁剪图层渲染结果"><figurecaption>裁剪图层渲染结果</figcaption></figure></p>
+<h2 id="layer-树">Layer 树</h2>
+<p>接下来从整个 Layer 树的层面来梳理以下渲染、更新的逻辑。</p>
+<h3 id="渲染、更新和缓存">渲染、更新和缓存</h3>
+<p>之前，我们说过 Layer 的最大好处就是，当一个 Layer 子树没有发生变化时，可以直接用缓存和其他图层进行合并，不用每次都重新进行绘制。这是怎么做到的呢？这就是本节（也就是本篇文章的下半部分重点阐述的问题）。我们可以参考下 Layer 的源码（位于 <code>src/rendering/layer.dart</code> 文件中），首先关注基类 <code>Layer</code>（摘录的源码作了一些简化，剔除了一些无关紧要的部分）：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">abstract</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Layer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">AbstractNode</span> </span>{
+    <span class="hljs-comment">// ...</span>
+
+    <span class="hljs-built_in">bool</span> <span class="hljs-keyword">get</span> alwaysNeedsAddToScene =&gt; <span class="hljs-keyword">false</span>;
+    <span class="hljs-built_in">bool</span> _needsAddToScene = <span class="hljs-keyword">true</span>;
+    <span class="hljs-keyword">void</span> markNeedsAddToScene() {
+      _needsAddToScene = <span class="hljs-keyword">true</span>;
+    }
+    <span class="hljs-built_in">bool</span> _subtreeNeedsAddToScene;
+    <span class="hljs-keyword">void</span> updateSubtreeNeedsAddToScene() {
+      _subtreeNeedsAddToScene = _needsAddToScene || alwaysNeedsAddToScene;
+    }
+}</code></pre>
+<p>解释一下：</p>
+<p>首先，<code>Layer</code> 的基类上有两个属性 <code>_needsAddToScene</code> 和 <code>_subtreeNeedsAddToScene</code>，顾名思义，前者表示需要加入场景，后者表示子树需要加入场景。通常，只有状态发生了更新（后面简称「脏了」），才需要加入到场景，所以这两个属性又可以直观理解为「自己脏了」和「子树脏了」。<code>Layer</code> 提供了 <code>markNeedsAddToScene()</code> 来把自己标记为「脏了」。派生类在自己状态发生变化时调用此方法把自己「弄脏」，比如 <code>ContainerLayer</code> 的子节点增删、<code>OpacityLayer</code> 的透明度发生变化、<code>PictureLayer</code> 的 <code>picture</code> 发生变化，如下所示：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">abstract</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Layer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">AbstractNode</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-keyword">void</span> adoptChild(AbstractNode child) {
+    markNeedsAddToScene();    <span class="hljs-comment">// 标记自己脏了</span>
+    <span class="hljs-keyword">super</span>.adoptChild(child);
+  }
+  <span class="hljs-comment">// drop 同理</span>
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">ContainerLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Layer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-keyword">void</span> append(Layer child) {
+    <span class="hljs-comment">// 吐槽，居然调到基类里去了，在基类里调 markNeedsAddToScene</span>
+    <span class="hljs-comment">// 要我说没必要</span>
+    adoptChild(child);
+    <span class="hljs-comment">// ...</span>
+  }
+  <span class="hljs-comment">// remove 同理</span>
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">OpacityLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">ContainerLayer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-keyword">set</span> alpha(<span class="hljs-built_in">int</span> value) {
+    <span class="hljs-keyword">if</span> (value != _alpha) {
+      _alpha = value;
+      markNeedsAddToScene();  <span class="hljs-comment">// 透明度变化时标记自己脏了</span>
+    }
+  }
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">PictureLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Layer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-keyword">set</span> picture(ui.Picture picture) {
+    <span class="hljs-comment">// 吐槽，这里又没有调 markNeedsAddToScene，直接设属性</span>
+    <span class="hljs-comment">// 而且这里又不比较 picture 是不是一致了，估计不是一个人写的</span>
+    _needsAddToScene = <span class="hljs-keyword">true</span>;
+    _picture = picture;
+  }
+}</code></pre>
+<p>当子节点把自己标脏时，父节点和所有祖先节点其实都脏了，之前渲染的结果缓存已经没用了。但是父节点不知道，这时通过 <code>updateSubtreeNeedsAddToScene()</code> 方法来进行更新。由于此方法涉及到子树，所以主要关注 <code>ContainerLayer</code> 上实现的该方法：遍历所有子树，递归调用 <code>updateSubtreeNeedsAddToScene()</code>，如果有任意一个子节点树脏了，那么也把自己标记为子树脏了。</p>
+<pre><code class="language-dart"><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">ContainerLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Layer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-keyword">void</span> updateSubtreeNeedsAddToScene() {
+    <span class="hljs-keyword">super</span>.updateSubtreeNeedsAddToScene(); <span class="hljs-comment">// 参考基类 Layer 的同名方法</span>
+    Layer child = firstChild;
+    <span class="hljs-keyword">while</span> (child != <span class="hljs-keyword">null</span>) {
+      child.updateSubtreeNeedsAddToScene();
+      <span class="hljs-comment">// 如果有任意一个子节点树脏了，那么自己为根的树也就脏了</span>
+      _subtreeNeedsAddToScene = 
+        _subtreeNeedsAddToScene || child._subtreeNeedsAddToScene;
+      child = child.nextSibling;
+    }
+  }
+}</code></pre>
+<p>绘制开始之前，从根节点上开始，递归检查自己的子树是不是「脏了」，这样每个节点上的 <code>_subtreeNeedsAddToScene</code> 属性就被修正为能够反映实际状态的情况。这就是为什么上面几个示例程序，在 <code>root</code> 被创建出来后，要先调用一下 <code>updateSubtreeNeedsAddToScene()</code> 方法。</p>
+<p>然后进行绘制，在根节点上调用 <code>addToScene</code> 以操作 <code>sceneBuilder</code>。<code>Layer</code> 的 <code>addToScene()</code> 是虚函数，<code>ContainerLayer</code> 的 <code>addToScene()</code> 会递归地调用子节点的 <code>addToScene()</code>，<code>OffsetLayer</code> 会调用 <code>sceneBuilder</code> 的 <code>pushOffset</code>（其他类推），而 <code>PictureLayer</code> 会调用 <code>sceneBuilder</code> 的 <code>addPicture</code>。如下所示：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">abstract</span> <span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">Layer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">AbstractNode</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  <span class="hljs-comment">// 我觉得 _needsAddToScene = true 放在这里更统一</span>
+  ui.EngineLayer addToScene(
+    ui.SceneBuilder builder, [ Offset layerOffset = Offset.zero ]);
+
+  <span class="hljs-keyword">void</span> _addToSceneWithRetainedRendering(ui.SceneBuilder builder) {
+    <span class="hljs-keyword">if</span> (!_subtreeNeedsAddToScene &amp;&amp; _engineLayer != <span class="hljs-keyword">null</span>) {
+      <span class="hljs-comment">// 这里是缓存重点！</span>
+      <span class="hljs-comment">// 如果子树没脏，而且有缓存 _engineLayer，就直接使用缓存数据</span>
+      builder.addRetained(_engineLayer);
+      <span class="hljs-keyword">return</span>;
+    }
+    <span class="hljs-comment">// 否则，走正常逻辑</span>
+    _engineLayer = addToScene(builder);
+    <span class="hljs-comment">// 标注自己为干净的</span>
+    _needsAddToScene = <span class="hljs-keyword">false</span>;
+  }
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">ContainerLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Layer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  ui.EngineLayer addToScene(
+    ui.SceneBuilder builder, [ Offset layerOffset = Offset.zero ]) {
+    <span class="hljs-comment">// 吐槽：为啥不直接把 addChildrenToScene 逻辑写在这，让子类调 super</span>
+    addChildrenToScene(builder, layerOffset);
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">null</span>;
+  }
+  <span class="hljs-keyword">void</span> addChildrenToScene(
+    ui.SceneBuilder builder, [ Offset childOffset = Offset.zero ]) {
+    Layer child = firstChild;
+    <span class="hljs-keyword">while</span> (child != <span class="hljs-keyword">null</span>) {
+      <span class="hljs-keyword">if</span> (childOffset == Offset.zero) {
+        <span class="hljs-comment">// 只看第一个分支好了，似乎很少会走第二个分支</span>
+        <span class="hljs-comment">// childOffset 几乎总是 Offset.zero</span>
+        child._addToSceneWithRetainedRendering(builder);  <span class="hljs-comment">// 转到基类里</span>
+      } <span class="hljs-keyword">else</span> {
+        child.addToScene(builder, childOffset);
+      }
+      child = child.nextSibling;
+    }
+  }
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">OffsetLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">ContainerLayer</span> </span>{
+  ui.EngineLayer addToScene(
+    ui.SceneBuilder builder, [ Offset layerOffset = Offset.zero ]) {
+    <span class="hljs-keyword">final</span> ui.EngineLayer engineLayer = builder.pushOffset(
+      layerOffset.dx + offset.dx, layerOffset.dy + offset.dy
+    );
+    <span class="hljs-comment">// 吐槽：要调一个莫名其妙的方法，直接调 super 多简单</span>
+    addChildrenToScene(builder);
+    builder.pop();
+    <span class="hljs-keyword">return</span> engineLayer;
+  }
+}
+
+<span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">PictureLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">Layer</span> </span>{
+  <span class="hljs-comment">// ...</span>
+  ui.EngineLayer addToScene(
+    ui.SceneBuilder builder, [ Offset layerOffset = Offset.zero ]) {
+    <span class="hljs-comment">// PictureLayer 操作 SceneBuilder</span>
+    builder.addPicture(
+      layerOffset, picture, 
+      isComplexHint: isComplexHint, willChangeHint: willChangeHint
+    );
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">null</span>;
+  }
+}</code></pre>
+<p>在根节点上调用 <code>addToScene</code>，节点首先根据自己的类型操作（<code>push</code>） <code>SceneBuilder</code> 对象，如果有子节点，会递归对子节点调用之，然后再 <code>pop</code>。<strong>但是</strong>，如果当前节点的子树是干净的，那么就会直接用之前的缓存来进行填充（<code>SceneBuilder#addRetained</code>），而缓存具体是指之前进行绘制时，<code>SceneBuilder#pushOffset</code> 方法返回的 <code>EngineLayer</code> 对象。</p>
+<p>用一张图来举例说明整个流程吧，假设我们的 Layer 树和上面 Opacity Layer 小节中的示例一直，只不过第一次渲染后，为背景矩形重新绘制了一个 <code>Picture</code>。图中为了直观，我把 <code>_needsAddToScene</code> 称为 selfDirty，把 <code>_subtreeNeedsAddToScene</code> 称为 treeDirty。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1ae8weubviK0jSZFNXXaApXXa-750-1250.png" alt="Layer 树的更新绘制逻辑"><figurecaption>Layer 树的更新绘制逻辑</figcaption></figure></p>
+<p>再次总结一下整个 Layer 树的核心逻辑：</p>
+<ul>
+<li>每个节点，都有「自己是否脏」和「子树是否脏」两个状态。初始状态下，自己是脏的，子树未知。</li>
+<li>每次渲染前，都会遍历整个 Layer 树，为每个节点确定「子树是否脏」状态。对某个父节点，如果后代任意一个子节点是脏的，那么这个父节点子树就脏了。</li>
+<li>渲染完成后，每个节点都会把自己设置为「干净」，这样下次确定「子树是否脏」时，就可能发生「整个子树都干净」的情形。</li>
+<li>节点自己发生变化，包括父节点的直接子节点增删、父节点属性变化、子节点属性变化，都会把自己弄脏。</li>
+<li>渲染时，如果发现某个节点子树是干净的（且有缓存存在），那么就会直接使用缓存来参与整棵树的合成。</li>
+</ul>
+<h3 id="验证-layer-树渲染流程">验证 Layer 树渲染流程</h3>
+<p>一个简单的小例子可以帮助验证上述的流程。</p>
+<pre><code class="language-dart"><span class="hljs-keyword">void</span> main(){
+
+  OffsetLayer root = <span class="hljs-keyword">new</span> OffsetLayer();
+  OffsetLayer animatedOffset = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">200</span>, <span class="hljs-number">200</span>));
+  PictureLayer animatedLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  OffsetLayer target = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">200</span>, <span class="hljs-number">700</span>));
+  ClipRRectLayer clip = <span class="hljs-keyword">new</span> ClipRRectLayer(
+    clipRRect: RRect.fromLTRBXY(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>, <span class="hljs-number">500</span>, <span class="hljs-number">500</span>, <span class="hljs-number">220</span>, <span class="hljs-number">220</span>)
+  );
+  PictureLayer leaf1 = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  PictureLayer leaf2 = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+
+  root.append(animatedOffset);
+  animatedOffset.append(animatedLeaf);
+  root.append(target);
+  target.append(clip);
+  clip.append(leaf1);
+  clip.append(leaf2);
+
+  leaf1.picture = createSolidRectanglePicture(
+    Color(<span class="hljs-number">0xFF00FF00</span>), <span class="hljs-number">500</span>, <span class="hljs-number">500</span>
+  );
+  leaf2.picture = createSolidRectanglePicture(
+    Color(<span class="hljs-number">0xFF0000FF</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>
+  );
+
+  <span class="hljs-built_in">int</span> count = <span class="hljs-number">0</span>;
+
+  <span class="hljs-built_in">int</span> countLoop = <span class="hljs-number">0</span>;
+  <span class="hljs-keyword">void</span> animate(){
+    countLoop = (countLoop + <span class="hljs-number">1</span>) % <span class="hljs-number">100</span>;
+    animatedLeaf.picture = createSolidRectanglePicture(
+      Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">300.0</span>+countLoop, <span class="hljs-number">300</span>
+    );
+    animatedOffset.offset = Offset(<span class="hljs-number">200</span>, <span class="hljs-number">200.0</span>+countLoop);
+  }
+
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+    animate();
+    count++;
+
+    SceneBuilder sceneBuilder = SceneBuilder();
+    root.updateSubtreeNeedsAddToScene();
+    <span class="hljs-keyword">if</span>(count == <span class="hljs-number">100</span>){
+      clip.remove();
+    }
+    root.addToScene(sceneBuilder);
+    Scene scene = sceneBuilder.build();
+
+    <span class="hljs-built_in">window</span>.render(scene);
+    <span class="hljs-built_in">window</span>.scheduleFrame();
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}</code></pre>
+<p>这个例子绘制的结果如下所示。上边的红色矩形在变化位置和尺寸，表示对 Layer 树的渲染在持续地进行中。我们重点考察的目标是下面的由蓝色和绿色组成的圆角矩形，即以 <code>target</code> 节点为根的子树。我们在渲染到 100 次的时候，把 <code>target</code> 子树的唯一子节点 <code>clip</code> 删掉，所以渲染开始过了一会儿之后，下方的圆角矩形就消失了。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1NI.Ye4v1gK0jSZFFXXb0sXXa-400-432.gif" alt=""></p>
+<p>要知道，在渲染过程中，我们没有修改过 <code>target</code> 子树下的任何一个图层，所以 <code>target</code> 子树应该是一直以缓存的形式参与渲染的。你可以在 Flutter Framework 代码里悄悄打印一些日志来验证你的想法。</p>
+<pre><code class="language-dart"><span class="hljs-comment">// Layer#_addToSceneWithRetainedRendering</span>
+<span class="hljs-keyword">if</span> (!_subtreeNeedsAddToScene &amp;&amp; _engineLayer != <span class="hljs-keyword">null</span>) {
+  <span class="hljs-built_in">print</span>(<span class="hljs-string">'builder.addRetained'</span>)
+  builder.addRetained(_engineLayer);
+  <span class="hljs-keyword">return</span>;
+}</code></pre>
+<p>我们尝试把 <code>root.updateSubtreeNeedsAddToScene();</code> 这一行注释掉，再次运行会报错，因为找不到节点上的 <code>_subtreeNeedsAddToScene</code>，毕竟连一次更新还没有做呢，「子树脏」状态还是未知的。</p>
+<p>尝试仅在第一次渲染时进行更新：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">if</span>(count &lt;= <span class="hljs-number">1</span>){
+  root.updateSubtreeNeedsAddToScene();
+}</code></pre>
+<p>渲染结果看上去没有任何变化，但是你会发现之前加的 <code>builder.addRetained</code> 日志再也不会打印出来了。这是因为，根据之前的流程，第一次渲染时所有的节点自身都是脏的，第一次更新的结果自然是：所有节点的子树都是脏的。从第二次开始，不再对「子树脏」状态进行更新，也就使得所有节点丧失了将「子树脏」更新为「子树干净」的可能。在渲染时，就不可能进入到使用缓存优化性能的逻辑了。</p>
+<p>尝试在前两次渲染前进行更新：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">if</span>(count &lt;= <span class="hljs-number">2</span>){
+  root.updateSubtreeNeedsAddToScene();
+}</code></pre>
+<p>我们会发现，下面的圆角矩形再也不会消失了。因为所有节点的「子树脏」状态都固定在了第二次渲染前更新后的，此时 <code>target</code> 的子树是干净的，一直在使用起缓存来参与上层节点的渲染。到了第 100 次渲染的时候，虽然 <code>target</code> 的子节点 <code>clip</code> 被删除了，<code>target</code> 也把自己弄脏了，但是「子树干净」这个状态再也无法逆转，使得圆角矩形再也不会消失。</p>
+<p>设置前两次和 1000 次之后才更新：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">if</span>(count &lt;= <span class="hljs-number">2</span> || count &gt; <span class="hljs-number">1000</span>){
+  root.updateSubtreeNeedsAddToScene();
+}</code></pre>
+<p>这时，需要过挺久（初始 Demo 的 10 倍），圆角矩形才消失。圆角矩形消失的时机是渲染到达了 1000 次，而真正的 Layer 树中，<code>clip</code> 子树早在 100 次的时候就被删掉了。从 100 到 1000 次的渲染都是依赖 <code>target</code> 的缓存来进行的。</p>
+<p>如果你能弄清楚以上这些情况，那么对 Layer 树的渲染逻辑就算是真正了解了。</p>
+<h3 id="scenebuilder-addretained">SceneBuilder addRetained</h3>
+<p>使用缓存进行绘制的时候，用到了 <code>SceneBuilder#addRetained()</code> 方法。<code>SceneBuilder</code> 本来是上一篇的内容，这里补充一下吧。</p>
+<pre><code class="language-dart"><span class="hljs-keyword">void</span> main(){
+
+  EngineLayer layer;
+  <span class="hljs-built_in">int</span> i = <span class="hljs-number">0</span>;
+
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+
+    i= (i + <span class="hljs-number">1</span>) % <span class="hljs-number">100</span>;
+
+    Picture redPic = 
+      createSolidRectanglePicture(Colors.red, <span class="hljs-number">200.0</span>+i, <span class="hljs-number">200.0</span>+i);
+    Picture bluePic = 
+      createSolidRectanglePicture(Colors.blue, <span class="hljs-number">200.0</span>+i, <span class="hljs-number">200.0</span>+i);
+
+    SceneBuilder sceneBuilder = SceneBuilder();
+    sceneBuilder.pushOffset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>);
+    sceneBuilder.pushOffset(<span class="hljs-number">200</span>, <span class="hljs-number">200</span>);
+    sceneBuilder.addPicture(<span class="hljs-keyword">new</span> Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>), redPic);
+    sceneBuilder.pop();
+
+    <span class="hljs-keyword">if</span>(layer == <span class="hljs-keyword">null</span>){
+      <span class="hljs-built_in">print</span>(<span class="hljs-string">'create layer'</span>);
+      layer = sceneBuilder.pushOffset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>);
+      sceneBuilder.pushOpacity(<span class="hljs-number">128</span>);
+      sceneBuilder.addPicture(Offset.zero, bluePic);
+      sceneBuilder.pop();
+      sceneBuilder.pop();
+    }<span class="hljs-keyword">else</span>{
+      <span class="hljs-built_in">print</span>(<span class="hljs-string">'add retained'</span>);
+      sceneBuilder.addRetained(layer);
+    }
+
+    sceneBuilder.pop();
+    Scene scene = sceneBuilder.build();
+    <span class="hljs-built_in">window</span>.render(scene);
+    <span class="hljs-built_in">window</span>.scheduleFrame();
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}</code></pre>
+<p>这段代码和上一篇中直接使用 <code>SceneBuilder</code> 的代码类似，绘制了两个逐渐增大的矩形。但是半透明的蓝色矩形只会在第一次渲染时使用，使用蓝色矩形绘制出的结果会被缓存在 <code>layer</code> 对象（<code>EngineLayer</code> 类的实例）中，从第二次开始调用 <code>addRetained()</code> 方法，传入 <code>layer</code> 对象。所以，我们可以看到蓝色矩形的尺寸是不会变化的。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1LU3YeYj1gK0jSZFuXXcrHpXa-400-216.gif" alt=""></p>
+<blockquote>
+<p>相信读者应该能够体会得出 <code>push</code> 开头的方法和 <code>add</code> 开头的方法间的差异。前者反应状态的改变，此状态可以被 <code>pop()</code> 出来，用于父节点；而 <code>add</code> 开头的方法则是传入一些数据，用于叶子节点。当节点使用缓存来参与上层渲染时，其子树不会被访问到，那么该节点就相当于叶子节点了。</p>
+</blockquote>
+<h3 id="自定义-layer">自定义 Layer</h3>
+<p>最后，我们通过继承 <code>ContainerLayer</code> 做一个自定义的 <code>Layer</code> 来体会一下 Layer 树的工作原理。自定义的 <code>ShakingLayer</code> 会使子树水平晃动，透明度也会随着晃动而改变，边缘位置的透明度较低。看一下这段代码：</p>
+<pre><code class="language-dart"><span class="hljs-class"><span class="hljs-keyword">class</span> <span class="hljs-title">ShakingLayer</span> <span class="hljs-keyword">extends</span> <span class="hljs-title">ContainerLayer</span></span>{
+
+  <span class="hljs-built_in">int</span> offset = <span class="hljs-number">0</span>;
+  <span class="hljs-built_in">int</span> step;
+
+  ShakingLayer(<span class="hljs-keyword">this</span>.step);
+
+  <span class="hljs-keyword">void</span> shake(){
+    offset += step;
+    <span class="hljs-keyword">if</span>(offset &gt;= <span class="hljs-number">100</span> || offset &lt;= <span class="hljs-number">-100</span>){
+      step = -step;
+    }
+    markNeedsAddToScene();
+  }
+
+  <span class="hljs-meta">@override</span>
+  EngineLayer addToScene(
+    SceneBuilder builder, [Offset layerOffset = Offset.zero]
+  ) {
+    <span class="hljs-keyword">final</span> EngineLayer engineLayer = builder.pushOffset(
+      layerOffset.dx + offset.toDouble(), layerOffset.dy
+    );
+    builder.pushOpacity((offset.abs().toDouble()*<span class="hljs-number">256.0</span>/<span class="hljs-number">100</span>).toInt());
+    <span class="hljs-keyword">super</span>.addToScene(builder);
+    builder.pop();
+    builder.pop();
+    <span class="hljs-keyword">return</span> engineLayer;
+  }
+}</code></pre>
+<p>重要的两点：</p>
+<ol>
+<li>重写 <code>addToScene()</code> 方法，通过向 <code>SceneBuilder</code> 对象中压入一些状态来实现晃动和透明度变化的功能。注意应该调用基类的同名方法把子节点加入场景。</li>
+<li>实现 <code>shake()</code> 方法给外部调用，每一帧改变一些属性值，使得下次渲染的结果发生变化。最重要的是，需要调用 <code>markNeedsAddToScene()</code> 告诉 Layer 树自身发生了改变，需要重绘。</li>
+</ol>
+<p>最后，把 ShakingLayer 插入到 Layer 树中，并在每一帧调用 <code>shake()</code> 方法：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">void</span> main(){
+
+  OffsetLayer root = <span class="hljs-keyword">new</span> OffsetLayer();
+
+  OffsetLayer offsetParent = <span class="hljs-keyword">new</span> OffsetLayer(offset: Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>));
+  ShakingLayer shakingLayer = <span class="hljs-keyword">new</span> ShakingLayer(<span class="hljs-number">10</span>);
+  PictureLayer offsetLeaf = <span class="hljs-keyword">new</span> PictureLayer(Rect.zero);
+  root.append(offsetParent);
+  offsetParent.append(shakingLayer);
+  shakingLayer.append(offsetLeaf);
+  offsetLeaf.picture = createSolidRectanglePicture(
+    Color(<span class="hljs-number">0xFFFF0000</span>), <span class="hljs-number">300</span>, <span class="hljs-number">300</span>
+  );
+
+  <span class="hljs-built_in">int</span> i = <span class="hljs-number">0</span>;
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+
+    i = (i + <span class="hljs-number">1</span>) % <span class="hljs-number">200</span>;
+    offsetParent.offset = Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300.0</span> + i*<span class="hljs-number">3</span>);
+    shakingLayer.shake();
+
+    root.updateSubtreeNeedsAddToScene();
+
+    SceneBuilder sceneBuilder = SceneBuilder();
+    root.addToScene(sceneBuilder);
+    Scene scene = sceneBuilder.build();
+    <span class="hljs-built_in">window</span>.render(scene);
+    <span class="hljs-built_in">window</span>.scheduleFrame();
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}</code></pre>
+<p>这是渲染效果：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1LQEUe.Y1gK0jSZFMXXaWcVXa-400-432.gif" alt="ShakingLayer 渲染结果"><figurecaption>ShakingLayer 渲染结果</figcaption></figure></p>
+<h2 id="小结">小结</h2>
+<p>这一篇主要讲了 Flutter Framework 的 Layer 层。Layer 层与 Engine 层是离得最近的，不少概念也在 Layer 和 Engine 间也互相映射。半透明效果、整体位移效果、裁剪效果都会生成一个新的 Layer。Layer 最重要的功能是把树状的结构输出到 Engine 的绘图队列中，组织起渲染的流程。同时，Layer 树的节点可以通过两种标记来判断自身是不是「脏了」，子树是不是「脏了」。如果有可能的话，Layer 节点会优先使用上一帧绘图得到的数据来参与上层的渲染，以节省开销。</p>
+<p>Layer 以上是 RenderObject 树，这是组织 UI 渲染的核心类。下一篇，我们将开始讲解 Flutter 的 RenderObject 相关的设计。</p>
+]]></description>
+            <link>http://xieguanglei.github.io/blog/post/flutter-code-chapter-02.html</link>
+            <guid isPermaLink="false">flutter-code-chapter-02</guid>
+            <dc:creator><![CDATA[谢光磊]]></dc:creator>
+            <pubDate>Thu, 05 Sep 2019 00:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Flutter Framework 源码解析（ 1 ）—— 开篇和绘图引擎的用法]]></title>
+            <description><![CDATA[<h1 id="flutter-framework-源码解析（-1-）-开篇和绘图引擎的用法">Flutter Framework 源码解析（ 1 ）—— 开篇和绘图引擎的用法</h1>
+<p>Flutter 是 Google 主导的跨平台 UI 开发解决方案，也是 2019 年前端界最热的名词（再加个「没有之一」，应该也不算过分吧）。因为工作的原因，我曾「被迫」完整地阅读了 Flutter Framework 的几乎所有代码，并使用另一种语言 TypeScript 重新实现了 Flutter Framework 的核心功能。这是一段痛苦的经历——至少在彼时，Flutter 的实现还远远称不上优雅。但是如今回望，这段经历也使我有机会得以一窥「世界级」UI 渲染框架的内部运行原理，令我「大开眼界」。正所谓念念不忘，必有回响，我准备开一个系列博文，讲一讲那段时间我阅读和实践 Flutter 的所见所闻。</p>
+<p>Flutter 与之前的跨平台 UI 开发解决方案（以 React 为代表）的最大区别，即 Flutter 是「自绘性」的。React 等框架最终需要借助具体平台的 UI 实现来落地：在 Web 上落实到 DOM API，在 iOS 和 Android 上各自落实到 iOS 和 Android 操作系统提供的 UI 组件，至于将组件<strong>画出来</strong>这个任务，则交由平台（WebView / iOS / Android）自己来实现了，画成什么样子，不得不受平台的钳制；而 Flutter 则更进一步，绕过平台的 UI 组件，直接落实到了绘图层，借助（Skia）这个强大的开源绘图引擎，自己把控了 UI 组件的绘制这一步骤。只要平台能够与 Skia 对接（通常是通过 OpenGL），Flutter 基本可以保证完全一致的渲染体验。Flutter 具有「自绘性」的特点，固然是因为它出现得比 React 晚，对 React 的痛点有深切的领悟，同时也与其团队的背景也密不可分——据说 Flutter 开发团队的许多成员都来自原 Chrome 浏览器 团队，而我们知道 Chrome 浏览器的绘图也是靠 Skia 完成的；所以 Flutter 其实与 Chrome 也有很深的渊源，某种意义上可视为完全没有 W3C 包袱的 Chrome 的继承者。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1sWT_c7Y2gK0jSZFgXXc5OFXa-477-300.png" alt="Flutter vs React"><figurecaption>Flutter vs React</figcaption></figure></p>
+<p>Flutter 的上层框架使用了 Dart 语言，这是一门优缺点都比较明显的语言（正如 Flutter 是一款优缺点都比较明显的框架）。Dart 在 Flutter 中扮演了极为重要的作用，从界面的描述，到布局、合成、绘制，整个渲染的逻辑（在 Chrome 中由 C++ 完成）有九成是由 Dart 完成的。本系列博文的讨论都将基于这门语言进行，但对 Dart 语言本身则不太会展开讲，我相信，对于前端工程师而言，Dart 语言本身造成的障碍是较为有限的，尤其是如果你已经使用过诸如 typescript 这样的具有类型系统的前端编程语言。如果你完全不了解 Dart，直接跟着本文熟悉 Dart，遇到问题去查阅一下文档，相信本系列文章完结时，你就能写出相当工整的 Dart 代码了。</p>
+<h2 id="flutter-架构">Flutter 架构</h2>
+<p>宽泛地说，从 UI 的描述到屏幕上的像素颜色，Flutter 处理的数据经过了以下几个阶段：</p>
+<ol>
+<li>Widget 树：抽象概念，表示用户对界面描述的方式。更准确地说，用户通过派生 <code>StatefulWidget</code> 或 <code>StatelessWidget</code> 类来实现顶层 <code>Widget</code> 类以描述整个应用，我们也通俗地将此行为称作「用户通过 <strong>Widget 树</strong>描述应用的 UI」。</li>
+<li>Element 树：树形数据结构，持久地存在于应用运行期间的 Dart 上下文中，根据 <code>Widget</code> 的变化更新自身管理的数据，并在必要的时候对 RenderObject 树进行调整（增删改）。Element 树与 Widget 树的节点几乎一一对应。</li>
+<li>RenderObject 树：树形数据结构，持久地存在于运行期间的 Dart 上下文中，接收来自 Element 树的同步。布局和绘制操作是针对 RenderObject 树进行的。RenderObject 树节点的数量通常略少于 Element 树的节点。</li>
+<li>Layer 链表：链表形数据结构，节点本身持久地存在于运行期间的 Dart 上下文中，并依附与某些特定的 RenderObject，但链表节点间的关系则依赖程序对 RenderObject 树的遍历；每次绘图，需将 Layer 链表同步给 Engine 层。Layer 链表中节点的数量是较少的，通常许多个 RenderObject 才对应一个 Layer 节点。</li>
+<li>Engine 层：由 C++ 实现的绘图层，依赖 Skia，为 Dart 提供少量但性能极高的绘图、合成 API。</li>
+</ol>
+<p>其中，1~4 通常又称为 Flutter Framework；而第 5 步则属于 Flutter Engine 的范畴。通常，不熟悉 Flutter 的读者可能对以上描述难以理解，请勿介怀（其实这几句是写给我自己整理思路的），大概能记住下面这张图就可以了。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1nx69c7P2gK0jSZPxXXacQpXa-202-314.png" alt=""></p>
+<h2 id="绘图引擎的基本用法">绘图引擎的基本用法</h2>
+<p>Flutter 是「自绘性」的渲染引擎，最终离不开绘图操作。我想先抛开 Widget，Element，RenderObject 这些概念，从 Flutter 所使用的绘图引擎开始讲起，这对后续的学习是很关键的。我们先按照 Flutter 官方提供的 <a href="https://github.com/flutter/flutter/wiki/Setting-up-the-Framework-development-environment">Flutter Framework 开发环境配置指南</a> 配置好环境，然后在 <code>examples</code> 目录中新建一个项目，即可以开始写一些 Dart 代码了。</p>
+<p>第一个段代码是这样的，我们用 Flutter Engine（<code>dart:ui</code>） 画了一条斜线，从 (300,300) 画到 (800,800)：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">import</span> <span class="hljs-string">'dart:ui'</span>;
+
+<span class="hljs-keyword">void</span> main(){
+
+  PictureRecorder recorder = PictureRecorder();
+  Canvas canvas = Canvas(recorder);
+
+  Paint p = Paint();
+  p.strokeWidth = <span class="hljs-number">30.0</span>;
+  p.color = Color(<span class="hljs-number">0xFFFF00FF</span>);
+
+  canvas.drawLine(Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>), Offset(<span class="hljs-number">800</span>, <span class="hljs-number">800</span>), p);
+
+  Picture picture = recorder.endRecording();
+
+  SceneBuilder sceneBuilder = SceneBuilder();
+  sceneBuilder.pushOffset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>);
+  sceneBuilder.addPicture(<span class="hljs-keyword">new</span> Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>), picture);
+  sceneBuilder.pop();
+  Scene scene = sceneBuilder.build();
+
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+    <span class="hljs-built_in">window</span>.render(scene);
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}</code></pre>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1SnH6cV67gK0jSZPfXXahhFXa-400-400.png" alt="一条斜线"><figurecaption>一条斜线</figcaption></figure></p>
+<p>真正做「画斜线」这件事的代码，只有调用 <code>canvas.drawLine</code> 的一行。用过 Canvas 的前端同学应该已经闻到一些熟悉的味道了吧。虽然 Canvas 2D 中虽然没有 <code>drawLine</code>，但是用 <code>moveTo</code> 和 <code>lineTo</code> 也能达到完全一致的效果，它们的核心绘图功能——画点，画线（直线，曲线），画多边形，甚至画图片，逻辑上是很容易对齐的。</p>
+<p>当然，更敏感的同学一定也发现了一些风格上的差异。比如说，传入坐标点的时候，Canvas 一般直接通过两个参数传入数值，而 Flutter Engine （后面简称为 Engine）则需要传入包装过的 <code>Offset</code> 对象，笔触的信息如颜色、线宽等也是类似。这能够方便 Framework 管理绘图所需的信息。</p>
+<blockquote>
+<p>实际和 C++ 通信的时候，还是直接传的参数，<code>Offset</code> 和 <code>Paint</code> 这类包装对象是由 Engine 提供的一层很比较薄的由 Dart 实现的桥接层来定义的。所以，在 Canvas 2D 之上，我们也是可以定义诸如类似的结构。</p>
+</blockquote>
+<p>除了调用 <code>canvas.drawLine</code>，Engine 的使用就比 Web 上的 Canvas 要复杂多了。Web Canvas 很直接，首先 <code>getContext()</code> 拿到上下文，然后就可以画点、画线、画图片了，所有的绘图会立刻反映到屏幕上；但是 Engine 中，绘图操作只是输出到了一个 <code>PictureRecorder</code> 的对象上；在此对象上调用 <code>endRecording()</code> 得到一个 <code>Picture</code> 对象，然后需要在合适的时候把 <code>Picture</code> 对象添加（<code>add</code>）到 <code>SceneBuilder</code> 对象上；调用 <code>SceneBuilder</code> 对象的 <code>build()</code> 方法获得一个 <code>Scene</code> 对象；最后，在合适的时机把 <code>Scene</code> 对象传递给 <code>window.render()</code> 方法，最终把场景渲染出来。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1uMT8c7L0gK0jSZFtXXXQCXXa-769-379.png" alt="从 PictureRecorder 到 Scene"><figurecaption>从 PictureRecorder 到 Scene</figcaption></figure></p>
+<p>有几点值得注意的：</p>
+<ol>
+<li><code>PictureRecorder</code> 对象是一次性的，当调用 <code>endRecording()</code> 之后，<code>PictureRecorder</code> 对象就被释放了。一个 <code>PictureRecorder</code> 只能关联一个 <code>Canvas</code> 对象。</li>
+<li>同理，<code>SceneBuider</code> 也是一次性的，调用 <code>build()</code> 后，<code>SceneBuilder</code> 对象即会失效。</li>
+<li><code>window.render(scene)</code> 只能在一次「绘图窗口期」内调用，也就是 <code>window.onDrawFrame</code> 或 <code>window.onBeginFrame</code>。Dart 没有提供原生的 <code>setTimeout</code> 或 <code>requestAnimationFrame</code>，但是 <code>window</code> 对象提供了类似的功能：在调用 <code>window.scheduleFrame()</code> 后，下一次屏幕刷新时，系统将依次调用 <code>window.onBeginFrame(Duration d)</code> 或 <code>window.onDrawFrame()</code>。而只有在这两个方法内调用 <code>window.render()</code> 方法，才能成功地进行绘图。</li>
+</ol>
+<h2 id="图层">图层</h2>
+<p>上面说到，用 Flutter Engine（或者说背后的 skia）绘图，与在 Web 上用 Canvas 2D 绘图相比，多了许多前置和后置步骤。这些繁琐的步骤对复杂系统 UI 的渲染是至关重要的。系统 UI 的一个重要特点（与游戏等 UI 场景相比）就是： 整个屏幕通常是由多个组（有时候又叫窗口、容器、<strong>图层</strong>等）来组成的，每个组内的逻辑是内聚，而整个组有时候会整体发生变化，如移动位置，变换，更改透明度。想象一下在 PC 桌面上拖动应用比如 Word，这时 Word 应用内部的复杂界面绝没有必要因为拖动而反复重绘，可以猜想 Windows 一定是将 Word 应用的绘图结果缓存在了某处，拖动 Word 之时只是拖动了这张「图片」（<code>Picture</code>）而已。</p>
+<p>看下面这个简单的例子：</p>
+<pre><code class="language-dart"><span class="hljs-keyword">import</span> <span class="hljs-string">'dart:ui'</span>;
+
+<span class="hljs-keyword">void</span> main(){
+
+  PictureRecorder recorder = PictureRecorder();
+  Canvas canvas = Canvas(recorder);
+
+  Paint p = Paint();
+  p.strokeWidth = <span class="hljs-number">30.0</span>;
+  p.color = Color(<span class="hljs-number">0xFFFF00FF</span>);
+
+  canvas.drawLine(Offset(<span class="hljs-number">300</span>, <span class="hljs-number">300</span>), Offset(<span class="hljs-number">800</span>, <span class="hljs-number">800</span>), p);
+  canvas.drawLine(Offset(<span class="hljs-number">800</span>, <span class="hljs-number">300</span>), Offset(<span class="hljs-number">300</span>, <span class="hljs-number">800</span>), p);
+
+  Picture picCross = recorder.endRecording();
+
+  <span class="hljs-built_in">window</span>.onDrawFrame = (){
+
+    <span class="hljs-built_in">int</span> i = <span class="hljs-built_in">DateTime</span>.now().millisecond;
+
+    PictureRecorder recorder = PictureRecorder();
+    Canvas canvas = Canvas(recorder);
+    canvas.drawLine(Offset(i*<span class="hljs-number">0.2</span>, <span class="hljs-number">550</span>), Offset(<span class="hljs-number">1080</span>-i*<span class="hljs-number">0.2</span>, <span class="hljs-number">550</span>), p);
+
+    Picture picLine = recorder.endRecording();
+
+    SceneBuilder sceneBuilder = SceneBuilder();
+    sceneBuilder.pushOffset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>);
+    sceneBuilder.pushOpacity(<span class="hljs-number">128</span>);
+    sceneBuilder.addPicture(<span class="hljs-keyword">new</span> Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>), picCross);
+    sceneBuilder.pop();
+    sceneBuilder.pushOffset(<span class="hljs-number">0</span>, <span class="hljs-number">0.5</span>*(i<span class="hljs-number">-500</span>));
+    sceneBuilder.addPicture(<span class="hljs-keyword">new</span> Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>), picLine);
+    sceneBuilder.pop();
+    sceneBuilder.pop();
+
+    Scene scene = sceneBuilder.build();
+
+    <span class="hljs-built_in">window</span>.render(scene);
+    scene.dispose();
+
+    <span class="hljs-built_in">window</span>.scheduleFrame();
+  };
+  <span class="hljs-built_in">window</span>.scheduleFrame();
+}</code></pre>
+<p>上面这个例子，我们用到了两个 <code>PictureRecorder</code>，分别对应创建了一个 <code>Canvas</code>。这两个 <code>Canvas</code> 构成了独立的「空间」，当在其上调用绘图方法如 <code>drawLine</code>，然后结束记录（<code>endRecording</code>）后，所绘制的图形就记录在了 <code>picture</code> 中。这里，我们先在 <code>picCross</code> 上画了一个叉叉（这个操作只做一次），然后在每一帧，生成一个新的 <code>picLine</code>，上面画一条长度随时间变化的横杠。然后，把两个 <code>Picture</code> 叠加合成起来，形成最终的场景。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1zzwXcW61gK0jSZFlXXXDKFXa-400-331.gif" alt=""></p>
+<p>注意，在这个例子中，画叉叉的操作只进行了一次，但是它每一帧都参与了动画的合成操作。如果这个叉叉特别复杂，只要它本身没有变化，也只需要去画一次，这就是分层（layer）和合成（composite）带来的优势。因为对 OpenGL 有一些了解，所以我猜测 <code>Picture</code> 的背后应该是 OpenGL 中的 <code>RenderBuffer</code> 或（Vulkan / Metal 中）类似的结构，已经缓存了绘制结果即像素值。在 Web 上的 Canvas 2D 上下文中，并没有特别高效的方法（<code>putImageData</code> 并不是一个好的方案）。</p>
+<p>合成的过程是通过对 <code>SceneBuilder</code> 进行 <code>push</code> 和 <code>pop</code> 操作完成的。<code>SceneBuilder</code> 维护着一个状态栈，你可以向其中压入或弹出一些状态，包括位移、透明度、裁剪等等。当栈里有一些状态时，向场景中加入（<code>add</code>）的内容，在合成时就会被栈中所有的状态依次影响。比如在上面这个例子中，<code>picCross</code> 会受到 <code>pushOffset(0,0)</code>、<code>pushOpacity(128)</code> 两个状态影响，即以半透明度渲染；而 <code>picLine</code> 会被 <code>pushOffset(0,0)</code>，<code>pushOffset(0, 0.5*(i-500))</code> 两个状态影响，即在 Y 方向（垂直方向）上发生 <code>0.5*(i-500)</code> 的位移。</p>
+<p>在 Flutter 中，层是隐藏在 RenderObject 背后的极为重要的概念。通常，一个半透明（或者位移的，或裁剪的）的容器节点（<code>RenderOpacity</code>）会单独创建一个图层，并使此节点下的所有子节点的绘制都发生在这个单独的层上。</p>
+<h2 id="绘图元素：点、线、面、文本、图片">绘图元素：点、线、面、文本、图片</h2>
+<p>前面我们仅仅用了绘制了一条直线段，这一节我们简单梳理一遍绘制其他主要元素。看下面这个例子：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1dGH8c1T2gK0jSZFvXXXnFXXa-400-461.jpg" alt="点、线、面、文本、图片"><figurecaption>点、线、面、文本、图片</figcaption></figure></p>
+<pre><code class="language-dart"><span class="hljs-keyword">import</span> <span class="hljs-string">'dart:ui'</span>;
+<span class="hljs-keyword">import</span> <span class="hljs-string">'dart:async'</span>;
+<span class="hljs-keyword">import</span> <span class="hljs-string">'dart:io'</span>;
+<span class="hljs-keyword">import</span> <span class="hljs-string">'dart:typed_data'</span>;
+<span class="hljs-keyword">import</span> <span class="hljs-string">'package:flutter/foundation.dart'</span>;
+
+<span class="hljs-keyword">void</span> main(){
+
+  PictureRecorder recorder = PictureRecorder();
+  Canvas canvas = Canvas(recorder);
+
+  Paint painterStroke = Paint();
+  painterStroke.strokeWidth = <span class="hljs-number">20.0</span>;
+  painterStroke.color = Color(<span class="hljs-number">0xFFFF00FF</span>);
+  painterStroke.style = PaintingStyle.stroke;
+
+  Paint painterFill = Paint();
+  painterFill.color = Color(<span class="hljs-number">0xFF00FFFF</span>);
+  painterFill.style = PaintingStyle.fill;
+
+  <span class="hljs-built_in">List</span>&lt;Offset&gt; points = <span class="hljs-keyword">new</span> <span class="hljs-built_in">List</span>&lt;Offset&gt;(<span class="hljs-number">3</span>);
+  points[<span class="hljs-number">0</span>] = <span class="hljs-keyword">new</span> Offset(<span class="hljs-number">100.0</span>, <span class="hljs-number">200.0</span>);
+  points[<span class="hljs-number">1</span>] = <span class="hljs-keyword">new</span> Offset(<span class="hljs-number">300.0</span>, <span class="hljs-number">200.0</span>);
+  points[<span class="hljs-number">2</span>] = <span class="hljs-keyword">new</span> Offset(<span class="hljs-number">400.0</span>, <span class="hljs-number">200.0</span>);
+  canvas.drawPoints(PointMode.points, points, painterStroke);
+  canvas.drawArc(
+      Rect.fromLTWH(<span class="hljs-number">100</span>, <span class="hljs-number">420</span>, <span class="hljs-number">200</span>, <span class="hljs-number">200</span>), 
+      <span class="hljs-number">0.0</span>, <span class="hljs-number">3.14</span>*<span class="hljs-number">1.5</span>, <span class="hljs-keyword">true</span>, painterStroke
+  );
+  canvas.drawCircle(Offset(<span class="hljs-number">350</span>, <span class="hljs-number">350</span>), <span class="hljs-number">80</span>, painterStroke);
+  canvas.drawRect(Rect.fromLTWH(<span class="hljs-number">100</span>, <span class="hljs-number">700</span>, <span class="hljs-number">300</span>, <span class="hljs-number">100</span>), painterFill);
+
+  ParagraphBuilder paraBuilder = <span class="hljs-keyword">new</span> ParagraphBuilder(<span class="hljs-keyword">new</span> ParagraphStyle(
+    fontSize: <span class="hljs-number">60</span>,
+  ));
+  paraBuilder.addText(
+      <span class="hljs-string">"Flutter is Google’s UI toolkit for building beautiful, "</span> +
+      <span class="hljs-string">"natively compiled applications for mobile, web, "</span> + 
+      <span class="hljs-string">"and desktop from a single codebase.\n"</span>);
+  Paragraph prg = paraBuilder.build();
+  <span class="hljs-built_in">print</span>(prg.height.toString());
+  prg.layout(<span class="hljs-keyword">new</span> ParagraphConstraints(width: <span class="hljs-number">900.0</span>));
+  <span class="hljs-built_in">print</span>(prg.height.toString());
+
+  canvas.drawParagraph(prg, <span class="hljs-keyword">new</span> Offset(<span class="hljs-number">100</span>, <span class="hljs-number">900</span>));
+
+  Future&lt;Codec&gt; loadImage() <span class="hljs-keyword">async</span> {
+
+    HttpClient clt = HttpClient();
+    <span class="hljs-built_in">Uri</span> resolved = <span class="hljs-built_in">Uri</span>.base.resolve(
+        <span class="hljs-string">"http://img.alicdn.com/tfs/"</span> +
+        <span class="hljs-string">"TB1_x5StSzqK1RjSZFpXXakSXXa-1024-1024.png"</span>
+    );
+    HttpClientRequest request = <span class="hljs-keyword">await</span> clt.getUrl(resolved);
+    HttpClientResponse response = <span class="hljs-keyword">await</span> request.close();
+    Uint8List bytes = <span class="hljs-keyword">await</span> consolidateHttpClientResponseBytes(response);
+    Codec cc = <span class="hljs-keyword">await</span> instantiateImageCodec(bytes);
+    FrameInfo fif = <span class="hljs-keyword">await</span> cc.getNextFrame();
+
+    canvas.drawImageRect(fif.image,
+        Rect.fromLTRB(
+            <span class="hljs-number">0</span>, <span class="hljs-number">0</span>, fif.image.width.toDouble(), fif.image.height.toDouble()),
+        Rect.fromLTWH(<span class="hljs-number">500</span>, <span class="hljs-number">250</span>, <span class="hljs-number">500</span>, <span class="hljs-number">500</span>), painterStroke);
+
+    Picture picture = recorder.endRecording();
+
+    SceneBuilder sceneBuilder = SceneBuilder();
+    sceneBuilder.pushOffset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>);
+    sceneBuilder.addPicture(<span class="hljs-keyword">new</span> Offset(<span class="hljs-number">0</span>, <span class="hljs-number">0</span>), picture);
+    sceneBuilder.pop();
+    Scene scene = sceneBuilder.build();
+
+    <span class="hljs-built_in">window</span>.onDrawFrame = (){
+      <span class="hljs-built_in">window</span>.render(scene);
+    };
+    <span class="hljs-built_in">window</span>.scheduleFrame();
+
+  }
+
+  loadImage();
+}</code></pre>
+<p>画点和画面都比较简单，按照规范在 canvas 上调用 API 就可以了。值得注意的是，是填充模式还是边框模式，需要在 <code>Paint</code> 类的实例中设置 <code>style</code> 属性。</p>
+<p>绘制文本稍微复杂一些，需要创建同样是一次性的 <code>ParagraphBuilder</code> 对象，添加文本（<code>addText</code>）后 <code>build</code> 出 <code>Paragraph</code> 对象。然后还没有完哦，我们需要按照特定的宽度对其进行排布（<code>layout</code>），以决定文本从哪里换行：当没有排布时，<code>Paragraph</code> 对象的 <code>height</code> 是 0，而排布之后，则具有了特定的高度。最后，用 <code>Canvas</code> 的 <code>drawParagraph</code> 方法把文本绘制出来。</p>
+<p>绘制图片也比较复杂，首先我们需要创建 <code>HttpClient</code> 对象去加载图片的数据，得到数据将其实例化为某种编码的图片 <code>Codec</code> 对象，然后从其中取一帧（有些图片格式包含多个帧，Flutter Engine 普遍地考虑了这种情况，即使是只有一帧的图片也包含「帧」的概念），并使用 <code>Canvas</code> 对象的 <code>drawImageRect</code>（或 <code>drawImage</code>）画出来。</p>
+<h2 id="小结">小结</h2>
+<p>这一篇，主要讲了 Flutter Engine 的一些用法。虽说系列文章的标题是「源码解析」，但是本篇中并没有太涉及源码本身。这是因为：</p>
+<ol>
+<li>本篇使用到的对象如 <code>SceneBuilder</code>，<code>PictureRecorder</code> 等其实是一层非常薄的包装层，稍微深入一下就会发现 <code>native</code> 关键字，内部逻辑已经进入了 C++ 实现的部分（即真正的 Flutter Engine），这一块我并没有仔细看过，也不在系列文章的范畴内；</li>
+<li>以我有限的经验来看，想深入了解一个库/框架/模块，与其直接看模块本身的代码，不如看模块的单元测试代码。先弄清楚模块的意图，弄清楚模块的依赖的用法，就更容易猜测出模块是如何实现的，这时再到模块代码中去寻求映证，反而比直接阅读模块本身代码的效率高，也有趣一些。</li>
+</ol>
+<p>通过本篇，我（或者读者）应能感受到 Flutter Engine 提供的 API 的原始（接近底层）风格；正是这种极为原始的操作能力，给了上层框架 Flutter Framework 以极高的灵活性，奠定了高性能 UI 渲染的基础。希望本篇能成为一个良好的开端，能够成为后面讲到 <code>Layer</code>，<code>RenderObject</code> 等概念的基石。</p>
+]]></description>
+            <link>http://xieguanglei.github.io/blog/post/flutter-code-chapter-01.html</link>
+            <guid isPermaLink="false">flutter-code-chapter-01</guid>
+            <dc:creator><![CDATA[谢光磊]]></dc:creator>
+            <pubDate>Mon, 12 Aug 2019 00:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[「译+注+修」Web 上的流媒体是如何工作的？]]></title>
+            <description><![CDATA[<h1 id="「译注修」web-上的流媒体是如何工作的？">「译+注+修」Web 上的流媒体是如何工作的？</h1>
+<blockquote>
+<p>在研究 Web 流媒体视频技术时，我发现了<a href="https://medium.com/canal-tech/how-video-streaming-works-on-the-web-an-introduction-7919739f7e1">这篇文章</a>。此文对前端工程师入门 Web 流媒体技术有很大帮助，阅读的同时翻译过来。文中的一些代码似乎运行不起来，或者缺失一些对前端开发者而言必要的上下文信息，所以我重写了所有示例代码，对文章本身也稍微修订了一下，一些地方增加了注解。</p>
+</blockquote>
+<p>以下为经过修订、注解后的译文，一部分插图重画了，代码被全部重写。</p>
+<hr>
+<blockquote>
+<p>本文主要介绍由 JavaScript 驱动的流媒体视频，主要面向 Web 开发者。大部分示例代码都是基于 HTML 和现代 JavaScript （ES6）编写的。如果你对 Web 前端技术不够熟悉，你可能会觉得本文难以阅读。</p>
+</blockquote>
+<h2 id="原生视频-api-的诞生">原生视频 API 的诞生</h2>
+<p>直到 2010 年 HTML5 出现之前，在 Web 上播放视频都依赖 Flash 插件。当时浏览器没有原生的解决方案，用户要么安装第三方插件如 Flash 或 Silverlight，要么就得忍受完全无法播放视频的处境。</p>
+<p>为了填补此空缺，<a href="https://whatwg.org/">WHATWG</a> 开始制定新的 HTML 标准，其中包括原生播放视频和声音的能力（不依赖插件）。此事的进程在 Apple 公开反对了 Flash 之后被加速了。</p>
+<p>这个新的标准，就是后来为人熟知的 HTML5。</p>
+<p>HTML5 带来了 <code>&lt;video&gt;</code> 标签。</p>
+<p>这个新标签允许你在 HTML 中直接嵌入一段视频，就像使用 <code>&lt;img&gt;</code> 标签嵌入图像一样。</p>
+<p>这很不错，但是对于专业的视频网站而言，<code>&lt;video&gt;</code> 标签有点过于简单了，与当时主流的 Flash 技术相比，<code>&lt;video&gt;</code> 标签缺少以下能力：</p>
+<ol>
+<li>实时切换视频的质量（清晰还是流畅），就像 youtube 一样；</li>
+<li>直播；</li>
+<li>根据用户喜好选择不同语言的音轨，就像 Netflix 一样。</li>
+</ol>
+<p>幸运的是，类似的问题在今天的浏览器中都已经得到了完善的解决，而解决的方案正是本文讨论的重点：</p>
+<h2 id="video-标签">Video 标签</h2>
+<p>HTML5 中嵌入视频很简单，只需在页面中增加一个 <code>video</code> 标签和一些属性即可，比如：</p>
+<pre><code class="language-html">&lt;html&gt;
+  &lt;head&gt;
+    &lt;meta charset=&quot;UTF-8&quot;&gt;
+    &lt;title&gt;My Video&lt;/title&gt;
+  &lt;/head&gt;
+  &lt;body&gt;
+    &lt;video src=&quot;red.mp4&quot; width=&quot;320px&quot; height=&quot;240px&quot; /&gt;
+  &lt;/body&gt;
+&lt;/html&gt;</code></pre>
+<p>HTML 页面将直接把 some_video.mp4 加载到浏览器中，看上去是这样：</p>
+<p><img src="http://img.alicdn.com/tfs/TB177y5bvb2gK0jSZK9XXaEgFXa-400-330.jpg" alt=""></p>
+<blockquote>
+<p>这里我使用了一个长达 30 秒，纯红色的视频，由 FFMPEG 生成。</p>
+<pre><code class="language-bash">$ ffmpeg -f lavfi -i color=color=red -t 30 red.mp4</code></pre>
+</blockquote>
+<p><code>video</code> 标签提供多个 API 以播放、暂停视频，调整视频播放的速度等：</p>
+<pre><code class="language-javascript">myVideo.pause();
+
+myVideo.currentTime = <span class="hljs-number">10</span>;</code></pre>
+<p>然而，大部分视频网站的功能都要比上面这个 <code>video</code> 标签复杂得多。比如，「调整视频质量」和「直播」这两个功能，仅依靠上述 API 就没法完成。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB10Ya4bq67gK0jSZFHXXa9jVXa-180-133.jpg" alt="Youtube 调整视频质量"><figurecaption>Youtube 调整视频质量</figcaption></figure></p>
+<h2 id="媒体源扩展（mse）">媒体源扩展（MSE）</h2>
+<p>媒体源扩展（Media Source Extensions，又简称 MSE）是 W3C 标准的一部分，目前大部分浏览器均已实现。此功能允许 JavaScript 对媒体（视频）的源进行复杂的操作。</p>
+<p>此「扩展」在 JavaScript 中增加了一个 <code>MediaSource</code> 对象。顾名思义，它表示视频的源——简单地说，就是视频背后的数据。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1_VS2b8r0gK0jSZFnXXbRRXXa-511-130.png" alt="源数据先 push 到 MediaSource 中，再显示到页面上"><figurecaption>源数据先 push 到 MediaSource 中，再显示到页面上</figcaption></figure></p>
+<p>MSE 仍然需要通过 <code>video</code> 标签发挥作用。只不过，我们不再简单地把 <code>video</code> 的 <code>src</code> 属性设置为一个指向远程资源的链接，而是设置为指向 <code>MediaSource</code> 对象的链接。</p>
+<p>W3C 定义了 <code>URL.createObjectURL</code> 方法，以创建一个链接指向客户端 JavaScript 上下文中的一个对象（而非通常情况下的远程资源）。我们就是通过这样的方法来把 <code>MediaSource</code> 对象赋给 <code>video</code> 标签的 <code>src</code> 属性上的。如下所示：</p>
+<pre><code class="language-javascript"><span class="hljs-keyword">const</span> video = <span class="hljs-built_in">document</span>.querySelector(<span class="hljs-string">'video'</span>);
+<span class="hljs-keyword">const</span> ms = <span class="hljs-keyword">new</span> MediaSource();
+
+video.src = <span class="hljs-built_in">window</span>.URL.createObjectURL(ms);</code></pre>
+<p>现在我们知道怎样吧 <code>MediaSource</code> 和 <code>video</code> 连接起来了，可是该怎么处理 <code>MediaSource</code> 呢？接下来我们引入一个概念：源缓冲区（source buffer）。</p>
+<h2 id="源缓冲区（source-buffer）">源缓冲区（Source Buffer）</h2>
+<p>视频流的数据，根本上是存储在 <code>SourceBuffer</code> 对象中。单个 <code>MediaSource</code> 对象包含了一个或多个 <code>SourceBuffer</code> 对象实例。每个 <code>SourceBuffer</code> 实例对应某种特定的流类型。简单地说，有三种流类型：</p>
+<ul>
+<li>音频</li>
+<li>视频</li>
+<li>音频和视频</li>
+</ul>
+<blockquote>
+<p>准确地说，流类型是通过 MIMEType 定义的，其中可能包含着关于编码格式的信息。</p>
+</blockquote>
+<p>多个 <code>SourceBuffer</code> 连接到单个 <code>MediaSource</code> 对象，再连接到 <code>video</code> 标签，这一切都是直接在 JavaScript 中完成的。</p>
+<p>有时候，我们会使用两个 <code>SourceBuffer</code>：一个视频流，一个音频流，这种用法很常见。</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1usy1b.T1gK0jSZFrXXcNCXXa-519-284.png" alt="源数据，SourceBuffer 和 MediaSource 间的关系"><figurecaption>源数据，SourceBuffer 和 MediaSource 间的关系</figcaption></figure></p>
+<p>将视频流和音频流分开，使得服务端也能够分开进行管理。这样做会带来一些好处（稍后讨论），以下是具体实现：</p>
+<pre><code class="language-javascript"><span class="hljs-keyword">const</span> audioSourceBuffer = 
+  mediaSource.addSourceBuffer(<span class="hljs-string">'audio/mp4; codecs="mp4a.40.2"'</span>);
+<span class="hljs-keyword">const</span> videoSourceBuffer = 
+  mediaSource.addSourceBuffer(<span class="hljs-string">'video/mp4; codecs="avc1.64000C"'</span>);
+
+fetch(<span class="hljs-string">"./vf.mp4"</span>)
+    .then(<span class="hljs-function"><span class="hljs-params">response</span> =&gt;</span> response.arrayBuffer())
+    .then(<span class="hljs-function"><span class="hljs-params">videoData</span> =&gt;</span> videoSourceBuffer.appendBuffer(videoData));
+fetch(<span class="hljs-string">"./af.mp4"</span>)
+    .then(<span class="hljs-function"><span class="hljs-params">response</span> =&gt;</span> response.arrayBuffer())
+    .then(<span class="hljs-function"><span class="hljs-params">audioData</span> =&gt;</span> audioSourceBuffer.appendBuffer(audioData));
+
+videoTag.addEventListener(<span class="hljs-string">'click'</span>, () =&gt; videoTag.play());</code></pre>
+<p>这样，我们就可以手动地为 <code>video</code> 标签分别添加视频和音频源了。</p>
+<blockquote>
+<p>接下来，应该讨论视频和音频源本身了。你可能注意到，视频和音频的格式都是 <code>mp4</code>。</p>
+<p>其实，<code>mp4</code> 只是一种<strong>容器格式</strong>，包含了一些媒体数据本身也具有的信息，比如开始时间，持续时长等。</p>
+<p>MSE 规范并未规定哪些格式是被浏览器支持的。对视频而言，最常见的两种容器格式是 <code>mp4</code> 和 <code>webm</code>，其中 <code>webm</code> 是由 Google 在 Matroska 格式（<code>.mkv</code> 文件）的基础上发展出来的。</p>
+</blockquote>
+<blockquote>
+<h2 id="译者注：">译者注：</h2>
+<p>当使用 <code>MediaSource</code> 管理视频播放源的时候，对视频源本身的格式，以及初始化的配置有着比较严格的要求。原文没有说明这一点，导致我无法将自己的本地视频按照此文的方式播放出来，而作者也没有提供示例视频。在一番实践之后，并且在 <a href="https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API/Transcoding_assets_for_MSE">这篇极好的文章</a> 的指导下，我终于把全流程走通了。这里比较详细地整理一下：</p>
+<h3 id="mse-媒体片段">MSE 媒体片段</h3>
+<p>首先，如果我们随便拿一个视频文件，按照上面的方法肯定是走不通的。使用 MSE 加载的源必须遵循了 <a href="https://www.w3.org/TR/mse-byte-stream-format-isobmff/">ISO BMFF Byte Stream Format</a> 这个标准。此标准是专门为流媒体制定的，通常将这样的媒体文件称为「片段（fragments）」，因为 MSE 被设计出来的作用就是加载媒体片段而不是整个媒体，这样就可以一边加载，一边把加载得到的片段加入（append）到源缓冲区中，甚至根据用户交互去加载不同的视频片段，从而获得对视频播放的更细粒度的控制权。普通的媒体文件一般不会遵循这个标准。</p>
+<p>为了检查一个媒体文件是不是片段，我们可以用 <a href="https://github.com/axiomatic-systems/Bento4">Bento4</a> 这个工具（此工具专门用来处理媒体文件的元信息）。这个工具需要自己编译安装。我自己试过在 Mac 上用 XCode 编译安装，还是挺容易的。总之安装完后，你就获得了一套命令行工具，其中一个名为 <code>mp4info</code> 的后面会频繁地用到。</p>
+<p>用 <code>mp4info</code> 查看某个媒体文件，比如上面用到的 <code>vf.mp4</code>。</p>
+<pre><code class="language-bash">$ mp4info ./vf.mp4
+File:
+  major brand:      iso5
+  minor version:    200
+  compatible brand: iso6
+  compatible brand: mp41
+  fast start:       yes
+
+Movie:
+  duration:   0 ms
+  time scale: 1000
+  fragments:  yes
+
+Found 1 Tracks
+Track 1:
+  flags:        3 ENABLED IN-MOVIE
+  id:           1
+  ......
+  Sample Description 0
+    ......
+    Codecs String: avc1.64000C</code></pre>
+<p>输出的数据里会有 <code>fragments:yes</code> 的信息，即表明是片段。除了用 <code>mp4info</code>，还有一个 <a href="http://nickdesaulniers.github.io/mp4info/">在线工具</a> 可以用来识别某个文件是不是「片段」。</p>
+<h3 id="生成片段">生成片段</h3>
+<p>怎么通过一个普通的媒体文件去生成片段呢，这时就需要借助大名鼎鼎的 <a href="https://ffmpeg.org/">FFMPEG</a> 了。FFMPEG 的安装很简单，对 Mac 来说，直接用 Homebrew 安装就行了。下面这个命令，把 <a href="http://wayback.archive.org/web/20161102172252id_/http://video.blendertestbuilds.de/download.php?file=download.blender.org/peach/trailer_1080p.mov">示例视频 trailer_1080p.mov</a>（你也可以换成任意其他视频，问题应该都不大）处理成片段（虽然只有一段）。</p>
+<pre><code class="language-bash">$ ffmpeg -i trailer_1080p.mov -vf scale=320:-1 -an \ 
+         -movflags frag_keyframe+empty_moov+default_base_moof vf.mp4</code></pre>
+<p>解释一下参数：</p>
+<ul>
+<li><code>-i trailer_1080p.mov</code>：输入媒体源。</li>
+<li><code>-vf scale=320:-1</code>：源媒体视频尺寸（1920x1080）有点大，将输出的尺寸改为宽度 320 并保持宽高比。</li>
+<li><code>-an</code>：此参数指定输出的媒体中仅包含视频部分，也就是只取画面，丢弃音轨。如果你用 <code>mp4info</code> 查看 <code>trailer_1080p.mov</code>，会发现其包含两个轨（track），一个画面，一个音频；但是 <code>vf.mp4</code> 就只有一个轨（<code>Found 1 Tracks</code>）。</li>
+<li><code>-movflags frag_keyframe+empty_moov+default_base_moof</code>：这就是将普通视频文件输出为符合 ISO BMFF 标准的片段文件了。</li>
+<li><code>vf.mp4</code>：输出文件。</li>
+</ul>
+<p>接下来生成音频源：</p>
+<pre><code class="language-bash">ffmpeg -i trailer_1080p.mov -c:a copy -vn \
+       -movflags frag_keyframe+empty_moov+default_base_moof af.mp4</code></pre>
+<p>解释一下新出现的参数：</p>
+<ul>
+<li><code>-vn</code>：和之前的 <code>-an</code> 对应，只提取音轨，丢弃视频。</li>
+<li><code>-c:a</code>：表示音轨部分是拷贝操作（之前视频部分，视频尺寸是需要压缩的，相当于已经设置了转换逻辑，不是单纯的拷贝）。</li>
+</ul>
+<p>这样，才最终生成了可以经由 MSE 加载的媒体片段文件。</p>
+</blockquote>
+<h1 id="媒体片段（media-segments）">媒体片段（Media Segments）</h1>
+<p>仍然有一些问题没有解决：</p>
+<ul>
+<li>需要等到整段内容加载完成并推送到 SourceBuffer 内，才能开始播放吗？</li>
+<li>如何在观看过程中切换不同质量的视频，或切换不同语言的音频？</li>
+<li>怎样播放直播视频（边拍摄边播放）？</li>
+</ul>
+<p>前面的例子中，我们用一个文件表示整段视频和整段音频。如果你想要做一些复杂点的事情（切换语言，视频质量，直播，等等），就会遇到一些麻烦。</p>
+<p>其实，在哪些视频网站的视频播放器内部，视频和音频数据都是被切成多个片段（segment），通常每个片段内只包含 2 到 10 秒的内容。</p>
+<p><img src="http://img.alicdn.com/tfs/TB12VS2b8r0gK0jSZFnXXbRRXXa-382-62.png" alt=""></p>
+<p>因为操控的是这些音视频片段，想做什么事情就很灵活了：我们可以在播放过程中逐渐地加载片段，并不算将加载到的片段向媒体中推送。</p>
+<p>看下面这个例子：</p>
+<pre><code class="language-javascript"><span class="hljs-keyword">const</span> vSegs = <span class="hljs-built_in">Array</span>.from(
+  { <span class="hljs-attr">length</span>: <span class="hljs-number">15</span> }, 
+  (v, i) =&gt; <span class="hljs-string">`./v/video/avc1/<span class="hljs-subst">${i === <span class="hljs-number">0</span> ? <span class="hljs-string">'init.mp4'</span> : <span class="hljs-string">`seg-<span class="hljs-subst">${i}</span>.m4s`</span>}</span>`</span>
+);
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">loadVSegs</span>(<span class="hljs-params">videoSourceBuffer</span>) </span>{
+    <span class="hljs-keyword">if</span> (vSegs.length === <span class="hljs-number">0</span>) {
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">'vSegs loaded'</span>);
+    } <span class="hljs-keyword">else</span> {
+        <span class="hljs-keyword">const</span> seg = vSegs.shift();
+        fetch(seg).then(<span class="hljs-function"><span class="hljs-keyword">function</span> (<span class="hljs-params">response</span>) </span>{
+            <span class="hljs-keyword">return</span> response.arrayBuffer();
+        }).then(<span class="hljs-function"><span class="hljs-keyword">function</span> (<span class="hljs-params">buffer</span>) </span>{
+            videoSourceBuffer.appendBuffer(buffer);
+            loadVSegs(videoSourceBuffer);
+        });
+    }
+}
+
+<span class="hljs-keyword">const</span> aSegs = <span class="hljs-built_in">Array</span>.from(
+  { <span class="hljs-attr">length</span>: <span class="hljs-number">2</span> },
+  (v, i) =&gt; <span class="hljs-string">`./a/audio/en/mp4a/<span class="hljs-subst">${i === <span class="hljs-number">0</span> ? <span class="hljs-string">'init.mp4'</span> : <span class="hljs-string">`seg-<span class="hljs-subst">${i}</span>.m4s`</span>}</span>`</span>
+);
+<span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">loadASegs</span>(<span class="hljs-params">audioSourceBuffer</span>) </span>{
+    <span class="hljs-keyword">if</span> (aSegs.length === <span class="hljs-number">0</span>) {
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">'aSegs loaded'</span>);
+    } <span class="hljs-keyword">else</span> {
+        <span class="hljs-keyword">const</span> seg = aSegs.shift();
+        fetch(seg).then(<span class="hljs-function"><span class="hljs-keyword">function</span> (<span class="hljs-params">response</span>) </span>{
+            <span class="hljs-keyword">return</span> response.arrayBuffer();
+        }).then(<span class="hljs-function"><span class="hljs-keyword">function</span> (<span class="hljs-params">buffer</span>) </span>{
+            audioSourceBuffer.appendBuffer(buffer);
+            loadASegs(audioSourceBuffer);
+        });
+    }
+}
+
+<span class="hljs-keyword">const</span> audioSourceBuffer = 
+  mediaSource.addSourceBuffer(<span class="hljs-string">'audio/mp4; codecs="mp4a.40.2"'</span>);
+<span class="hljs-keyword">const</span> videoSourceBuffer = 
+  mediaSource.addSourceBuffer(<span class="hljs-string">'video/mp4; codecs="avc1.64000C"'</span>);
+
+loadVSegs(videoSourceBuffer);
+loadASegs(audioSourceBuffer);</code></pre>
+<p>对应的，服务器端存储着多个媒体文件片段，目录基本结构如下所示：</p>
+<pre><code class="language-bash">├── a
+│   ├── audio
+│   │   └── en
+│   │       └── mp4a
+│   │           ├── init.mp4
+│   │           └── seg-1.m4s
+│   └── stream.mpd
+├── v
+│   ├── stream.mpd
+│   └── video
+│       └── avc1
+│           ├── init.mp4
+│           ├── seg-1.m4s
+│           ├── seg-10.m4s
+│           ├── seg-11.m4s
+│           ├── seg-12.m4s
+│           ├── seg-13.m4s
+│           ├── seg-14.m4s
+│           ├── seg-2.m4s
+│           ├── seg-3.m4s
+│           ├── seg-4.m4s
+│           ├── seg-5.m4s
+│           ├── seg-6.m4s
+│           ├── seg-7.m4s
+│           ├── seg-8.m4s
+│           └── seg-9.m4s</code></pre>
+<blockquote>
+<p>真正的流媒体服务器上，文件通常不是物理分割的，浏览器可以使用 HTTP 的 Range 头来向服务器请求文件片段，而服务端可以做任意的操作，只需要保证有正确的返回即可。不过这些是实现细节，目前我们就假设服务器上都是物理分割好的静态文件，按照此目录结构排放。</p>
+</blockquote>
+<p>在这个例子中，我们终于不用等音频或视频全部加载完成后才能开始播放了：只需要加载第一个视频和音频片段，即可开始播放。视频网站上的流媒体播放器各自有一些加载策略，但是基本逻辑是一致的：即尽量按照次序先加载一些片段，然后开始播放。你可以在 Firefox / Chrome / Edge 浏览器的开发者工具的 NetWork 标签页观察到这些播放器加载媒体的节奏。</p>
+<p>顺便提一句，你可能注意到，我们在把片段数据推送源缓冲区的时候，没有指定该片段处于视频时间轴的哪个位置（几秒到几秒）上。实际上，推送片段的顺序和片段的时间前后没有关系，片段内已经包含了足够的信息来描述自己处于视频的那个位置。我们没有必要像例子中一样严格按照顺序加载片段。</p>
+<blockquote>
+<h2 id="译者注">译者注</h2>
+<p>原文也没有提供将单个片段切割为多个片段的方法。这里补充一下：</p>
+<p>之前安装的 Bento4 提供了一些 python 文件，其中有一个 <code>mp4-dash.py</code> 文件可用于做文件切割。</p>
+<pre><code class="language-bash">$ python mp4-dash.py --<span class="hljs-built_in">exec</span>-dir=&lt;path to Bento4 tools&gt; ./vf.mp4</code></pre>
+<pre><code class="language-bash">$ python mp4-dash.py --<span class="hljs-built_in">exec</span>-dir=&lt;path to Bento4 tools&gt; ./af.mp4</code></pre>
+<p>其中 <code>&lt;path to Bento4 tools&gt;</code> 是你放置 Bento4 编译产物的目录。</p>
+<p>一般来说这样的工作都是整合到工作流里的，因为本身是脚本语言通过调用 Bento4 工具来完成的，所以整合进工作流应当是很容易的。我这里是直接调用此脚本，然后手动微调目录结构，最后得到了上述的目录结构。</p>
+</blockquote>
+<h2 id="自适应的媒体流（adaptive-streaming）">自适应的媒体流（Adaptive Streaming）</h2>
+<p>许多播放器有类似「画质-自动」的选项，即根据用户网络等情况来自动选择画质，此即自适应的媒体流。</p>
+<h2 id="切换语言">切换语言</h2>
+<p>一个更复杂的场景时切换语言，如 Netflix，Amazon Prime Video 或者 MyCanal 上，不同语言的音频是不同的。</p>
+<blockquote>
+<h2 id="译者注-1">译者注</h2>
+<p>此两节我就没有翻译了，因为其实都是可以预见的业务逻辑。当用户进行操作的时候，从另一个地方去加载媒体片段，然后添加到当前正在播放的视频流中来。</p>
+<p>有一个知识点值得注意的是，<code>SourceBuffer#remove</code> 方法可以移除已经添加的数据。比如当用户切换了语言，那么原有的已经被添加到流中，但是还未播放的音频数据就没有用了，这是可以调用此方法来进行清理。</p>
+</blockquote>
+<h2 id="直播">直播</h2>
+<p>我们还没有讨论过直播。近年来，直播变得非常流行（twitch.tv，YouTube 直播，等等）。本文上面讨论的这些技术，也被深入地用在直播的场景中。</p>
+<p>假设现在 YouTube 上正在进行一场直播，开始与 4 秒之前。</p>
+<p>假设每个媒体片段的长度为 2 秒，那么现在 YouTube 的服务器上应该已经存在了 2 段视频片段和 2 段音频片段，一段（segment0s）表示 0<del>2 秒，一段（segment2s）表示 2</del>4 秒：</p>
+<pre><code>./audio/
+  ├── segment0s.mp4
+  └── segment2s.mp4
+./video/
+  ├── segment0s.mp4
+  └── segment2s.mp4</code></pre><p>第 5 秒的时候，下一个媒体片段还没有被生产出来，服务器上的文件状态没有变：</p>
+<p>第 6 秒，下一个媒体片段被生产出来了，服务器上是这样的：</p>
+<pre><code>./audio/
+  ├── segment0s.mp4
+  ├── segment2s.mp4
+  └── segment4s.mp4
+./video/
+  ├── segment0s.mp4
+  ├── segment2s.mp4
+  └── segment4s.mp4</code></pre><p>从服务器的角度来说，这很合理。直播的内容不是连续的，而是离散地一段一段地生成出来。</p>
+<p>这时的问题是，浏览器端的 JS 如何知道什么时候去获取最新的媒体片段？也许，我们可以在客户端起一个定时器，预测服务器上什么时候会有下一个片段，按照 <code>segmentX.mp4</code> 的格式，到时间了就试图去服务器上请求媒体片段。这种做法很容易引起问题：比如，也许媒体片段并不是每段的长度都相等；又比如，服务器也许无法精确地控制每一段视频生成的时间，也许服务器是不是要花时间清理前面生成的旧数据呢；（又比如，客户端和服务端的计时器本来就可能存在误差，译者注）。从浏览器端的角度，我们希望在最后一段视频被生产出来后，尽快地请求到并播放；同时，我们也不希望过早地进行请求（这样会得到 404 错误）。</p>
+<p>这个问题，通常是用传输协议，有时也成为流媒体协议（Streaming Media Protocol）来解决的。</p>
+<blockquote>
+<h3 id="译者注-2">译者注</h3>
+<p>其实不管如何，直播总是会有可感知的延迟的。至少一个片段所包含的时间是如何优化都优化不了的。片段又不可能太小，太小的话数量就太多了，又会有其他的问题。</p>
+<p>对于实时要求更高的通讯场合，比如视频聊天，远程控制等等，通常需要借助更基础的协议比如 WebRTC 来完成。</p>
+</blockquote>
+<h2 id="流媒体协议">流媒体协议</h2>
+<p>仔细地解释流媒体协议超出了本文的范畴，但是简单地说，所有流媒体都有个核心概念：Manifest。Manifest 是用来描述服务器上视频片段的元信息文件。</p>
+<p>通过 Manifest 文件，你可以获知：</p>
+<ul>
+<li>服务器上有哪些视频和音频片段资源（即，URL 是什么），音频支持哪几种语言。</li>
+<li>视频有哪些分辨率可选择，音频有哪些码率可选择。</li>
+<li>以及最重要的，目前直播的进展是怎样的，最新的视频和音频片段是哪个。</li>
+</ul>
+<p>几种主要的流媒体协议包括：</p>
+<h3 id="dash">DASH</h3>
+<p>YouTube，Netflix 和 Amazon Prime Video 使用此协议。基本格式为 XML，具有很大的灵活性，支持大多数场景如音频描述，家长控制，等。编解码器无关。</p>
+<h3 id="hls">HLS</h3>
+<p>由 Apple 开发，DailyMotion，Twitch.tv 使用此协议。采用 m3u8 格式（m3u 播放列表文件，UTF-8编码）。</p>
+<h3 id="smooth-streaming">Smooth Streaming</h3>
+<p>Developed by Microsoft, used by multiple Microsoft products and MyCanal. In Smooth Streaming, manifests are called… Manifests and are XML-based.</p>
+<p>由 Microsoft 开发，多个 Microsoft 产品和 MyCanal 使用此协议。基于 XML。</p>
+<h2 id="真实世界">真实世界</h2>
+<p>如你所见，网络视频背后的核心概念是在 JavaScript 中动态获取和播放视频、音频片段。播放器其实是一个非常复杂的模块，它需要包括：</p>
+<ul>
+<li>下载和解析某种流媒体协议清单文件</li>
+<li>猜测当前的网络状况</li>
+<li>获取用户的偏好设置（例如，偏好语言）</li>
+<li>基于前两点（网络和用户偏好），来决策去下载哪个媒体片段</li>
+<li>管理一个队列，尽量在正确的时间下载正确的片段（一下子把所有片段都下载下来是低效和浪费的，但严格按照先后顺序下载片段又太死板和缓慢了，这里非常需要策略）</li>
+<li>播放字幕，通常完全由 JS 管理</li>
+<li>可能还要管理缩略图队列，有的播放器允许用户在把鼠标悬停在进度条上时看到缩略图</li>
+<li>DRM 管理（是什么？译者注）</li>
+<li>以及很多其他功能……</li>
+</ul>
+<p>所以尽管如此，目前复杂的 Web 视频播放器，基本都是基于 MediaSource 和 SourceBuffers 开发的。</p>
+]]></description>
+            <link>http://xieguanglei.github.io/blog/post/how-stream-video-works-on-web.html</link>
+            <guid isPermaLink="false">how-stream-video-works-on-web</guid>
+            <dc:creator><![CDATA[谢光磊]]></dc:creator>
+            <pubDate>Wed, 31 Jul 2019 00:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[冲绳那霸步行观光一日游记]]></title>
+            <description><![CDATA[<h1 id="冲绳那霸步行观光一日游记">冲绳那霸步行观光一日游记</h1>
+<p>2019年6月30日，我和同事们在日本冲绳自由行。这一天，我的计划是去那霸市的新都心商业区逛一逛，最好能买些东西。从住的酒店到新都心的距离约为两千米，我选择了步行前往。其实，在一座陌生的城市步行是种非常微妙的体验，我看见了许多只有步行才能看见的寻常风景。一周过去了，这些风景依然历历在目。不知为什么，我觉得应该把这天步行的经历记录下来。这篇文章也许会是冗长和无聊的流水账——不过借助这篇文章，我似乎觉得又和那一天、那个地方产生了某种奇妙的关联，使我欣慰。这也许就是旅行的意义吧。</p>
+<p>在冲绳，日头升得晚，落得也晚，人们的生活节奏自然跟着晚了。商店早上十点才开张，我差不多十点从那霸 WBF 酒店（<strong>ホテルWBFアートステイ那覇</strong>）出发，沿着沖映通（<strong>沖映通り</strong>）路向西北方向前进。我的第一个目的地是Junkudo（<strong>ジュンク堂書店</strong>）。前一晚打车回酒店途中，我发现了这家书店。街道上非常安静，偶尔有一两个行人，时不时驶过一辆车，两三家居酒屋的门都紧闭着，只有招牌或灯笼安静地垂在阳光下，路南侧有个砂石地面停车场，出入口只有一车宽，边上立着牌子标明车位日租的价格（记得是 800 円一天）。经过一条无名道路岔口时，向道路深处看去，天很蓝，风景很棒。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/2.jpg" alt="WBF 酒店"><figurecaption>WBF 酒店</figcaption></figure></p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/1.jpg" alt="无名道路岔口"><figurecaption>无名道路岔口</figcaption></figure></p>
+<p>这家书店的体量超出了我的预期，共三层，单层面积大约就接近 2000 平米，印象中北京的西单图书大厦也不过这个规模，没有想到区区冲绳小县有这么大的书店。和国内一样，书店一楼最外层是「畅销书」展区，内层则分布着一排排立式书架。书架上密密麻麻地摆满了书，同一本书的册数并不多，而且是比较严谨地按照图书馆里的那套分类系统进行分类的。日本的书开本都偏小，包括很多严肃书籍，而且相当部分的书保留着从右向左竖排的传统。书店一楼有一个「门」子形的角落，里面赫然摆着色情小说，封面很是诱惑，内容是日语文本——我内心暗暗称奇。</p>
+<p>我尝试寻找自己翻译的《WebGL 编程指南》的日语原版，向店员求助查找书的地方（冲绳英语的普及度不高，与当地人交流需要依靠翻译软件），店员带我到角落里一台上了年代的电脑前。我在老式的 JSP 风格的 Web 页面上查找到了我想要的那本书，只剩最后一本了，果断去拿下来。日本的书比较贵，比如这本书要 5800 円，算加上税再折算成人民币接近 400 元了，而国内的译本只需要 60~80 元。虽然贵，但我还是买下来当作纪念了。</p>
+<p>从书店出来，如果继续沿着沖映通走的话，很快就到大路（和空铁平行的那条路）了。于是折进一条无名小路。小路上的行人就更少了弯弯绕绕，更没有什么行人了。路过一家自助洗衣店，门打开着，里面摆满了上下两排洗衣机（或者下面是洗衣机上面是烘干机），最里面的墙边还摆着案台和神龛，一个人都没有。我把头探进去看了看，又退了出来。</p>
+<p>继续向前走，来到一家全家（FamilyMart）便利店（冲绳的全家遍地都是），买了一个饭团和一个鸡腿，买完才发现这家店内没有桌椅。这就尴尬了，在日本在公共场合吃东西似乎是一种挺不礼貌的行为。我只好把吃的收进包里，饿着肚子，继续前进。很快又到了大路，沿着这条与空铁平行的大路，到达了一家 MaxValue 超市（<strong>マックスバリュ牧志店</strong>），贩卖着水果、蔬菜、肉类等日常用品——看了看价格，胡萝卜大约要 6 元人民币一根，番茄大约要 10 元——和国内比还是挺贵的。</p>
+<p>离开 MaxValue 超市，继续沿大路前进不远，就来到了牧志公园（<strong>牧志公園</strong>）。虽说是公园，其实是个很小的街心绿地，不过，这里似乎是游客聚集的地方，一棵大树的树荫下环绕排着一圈条凳，地上零零散散地散落着三四个塑料瓶。我心想，在这里吃东西应该不会遭受过于异样的眼光吧，于是就在树荫下的条凳上吃完了这天的午餐。两个白人老外在旁边的海盐冰淇淋店聊天；一对年轻男女在冰淇淋店背后的住宅楼下，靠着广告牌有说有笑；国际通（<strong>国際通り</strong>）路对面是一家酒店，一个父亲背后跟着女儿，正提着很大的行李箱上台阶。</p>
+<p><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/M1-o.png" alt=""></p>
+<p>接着，我从天桥穿过空铁牧志站，沿着国际通向东前进。不得不提的是，日本的无障碍设施真不是随便说说的：盲道和电梯严丝合缝，电梯旁的使用指南上都刻着盲文。在这段路南侧，有一家看着挺大的综合体（Google 地图上搜不到准确的名字，只能搜到类似 Cargose Shopping Mall 之类的信息）。进去逛了逛。一楼是家大型免税店，二楼是几家餐厅，三楼居然是一家社区图书馆。虽然我很想上去看一看 ，但是通往三楼的电梯边立着类似「游客止步」的牌子。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/8.jpg" alt="电梯与盲道"><figurecaption>电梯与盲道</figcaption></figure></p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/9.jpg" alt="电梯与盲文"><figurecaption>电梯与盲文</figcaption></figure></p>
+<p>继续向东，来到了国际通和崇元寺通（<strong>崇元寺通り</strong>）路的交叉口。路东北有一家食品店，我在路对面等红灯。红灯的时间有点久，沿着<strong>崇元寺通り</strong>向西北望去，道路两侧静静耸立着建筑，澄蓝的天空从建筑形成的天际线的缺口处透出来，时间仿佛静止了一般。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/3.jpg" alt="国际通与崇元寺通岔口"><figurecaption>国际通与崇元寺通岔口</figcaption></figure></p>
+<p>红绿灯终于变绿，我穿过马路。我没有选择崇元寺通这条大路，而是沿着穿过安里（<strong>安里</strong>）社区的一条弯弯曲曲的小道前进。之前，我在地图上发现这条小道经过一座神社，所以故意选了这条路。这条路上的商店很少，两侧都是那种独门独栋的住宅即「一户建」。走了一段上坡路后，终于看到了神寺（<strong>八幡神徳寺</strong>）和神社（<strong>琉球八社安里八幡宮</strong>）。虽然对日本的宗教文化没有了解，但是当我看到常在宫崎骏电影中出现的「鸟居」（神社大门）时，还是有一丝兴奋的感觉。</p>
+<p>神寺和神社位于小路拐弯的地方：神寺在左手边，由石头矮墙环绕。走进中庭，左侧是树木，右边似乎是一口水井，井上面有红色的龙头装饰；面前便是寺的主建筑了，透过移门上的玻璃，可看见内里铺着席子，还放置着几台电扇，倒是有几分烟火气，似乎是周围居民举行宗教集会的场所。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/10.jpg" alt="神寺"><figurecaption>神寺</figcaption></figure></p>
+<p>走出神寺左转，就是神社了。拾级而上，最上面一节台阶后立着石制的鸟居，鸟居明显有些年头了，比神社建筑要古老一个年代。进入鸟居，我站在一个小院子里，院子的角落里堆着一些幼儿的户外玩具——隔壁是托儿所（<strong>愛泉保育園</strong>）——整个院子打扫得很干净。面前立着一左一右两座纪念碑，纪念碑后就是神社的主建筑了，大红色的柱子，木墙，屋顶，坐落在半人高的基座上，檐下挂着一些纸片装饰。神社主建筑的大门敞开着，里面摆着案台和贡品。贡品的样子我一下子就认出来了，就是宫崎骏电影《我的名字》中装口嚼酒的那种瓷瓶。绕到建筑背后，发现了一间废弃的旧木屋，大概是此神社的旧址——现在的应该是某个时期重建的。我在院子里静静地站了二十分钟，没有一个人，风吹过纸片，神明似乎真的存在。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/4.jpg" alt="鸟居"><figurecaption>鸟居</figcaption></figure></p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/5.jpg" alt="神社"><figurecaption>神社</figcaption></figure></p>
+<p>从神社出来，继续沿着这条小路向前（这是已向西），路两侧的「一户建」少了一些，取而代之的是一栋栋多层小楼。一层是车库，三三两两地停着小车，楼上像是一间间公寓，阳台整整齐齐地排列着——似乎不是当地人的居所，而是日本本岛的居民来度假时居住的公寓。迎面走来一个年轻的爸爸，背后跟着一儿一女，三人头发尽湿，小男孩只穿着短裤，像是游泳归来。可能是这条路上少有陌生人的缘故，我们擦肩而过时小男孩一直抬头盯着我看，搞得我都有点不好意思，走在前面的爸爸似乎也带着半分警惕和半分歉意地看了我一眼。走远后，我在一个橱窗前停下，橱窗里似乎公示着附近几所小学的施教范围（日本也有学区房吗？），这时我听见那个男孩在大声喊话，听到了<strong>お父さん（Otōsan）</strong>和<strong>お母さん（Okāsan）</strong>两个单词（稍微看过一点日本电影的对这两个词应该都不会陌生吧），我心里翻译了一下，大概是「妈妈，我们和爸爸回来啦！」。</p>
+<p>继续向前走，路渐渐在下坡了。想来神社确实是建在山丘的最高处，在新都心的那些十几层高的摩天大楼还未建成时，神社也许是附近最高的建筑。继续向前走了几百米，突然豁然开朗了。路左侧不再有建筑，我才发现我已经站在一个小山坡上，左侧是陡峭的水泥防护坡（用于防止滑坡），约六七米高，坡底是一条宽阔的公路即 251 县道（<strong>県道 251 号</strong>）。站在山坡上向左侧望去，则是高高低低，鳞次栉比的房屋叠起来的那霸天际线。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/7.jpg" alt="豁然开朗的天际线"><figurecaption>豁然开朗的天际线</figcaption></figure></p>
+<p><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/M2-o.png" alt=""></p>
+<p>不远处有一座人行天桥。经过天桥来到大路西侧，沿着大路继续向前，这时其实距离新都心商业区已经不远了。我又累又渴，恰好经过一家全家（<strong>ファミリーマートおもろまち二丁目店</strong>）。买一杯冰淇淋，然后取了一点日元现金，在店里的窄桌边休息一下。右边隔着两个座位坐着一个穿校服的年轻妹子，背后是穿着蓝色衬衫的男子，都连着桌面上的 USB 接口为手机充着电（不得不说，国内的共享充电宝行业比日本领先很多）。虽然道路上行人很少，车辆也不多，但是全家却时不时地有人进进出出的，不知道他们是从哪里冒出来的。</p>
+<p>离开全家，终于来到了新都心——<strong>那霸</strong>最大的商业区，这里坐落着冲绳最大的博物馆（<strong>沖縄県立博物館・美術館</strong>），可惜这几天正值维修闭馆期间，无法参观。在 Main Place（<strong>サンエー那覇メインプレイス</strong>）——一家商业综合体里逛了大约一个多小时，买了些纪念品；然后在雅马哈电器卖场（<strong>ヤマダ電機 テックランド那覇本店</strong>）逛了一个小时左右，买了一些 Switch 配件和两款 Switch 游戏；最后去 MUJI 无印良品工厂店（<strong>無印良品 天久</strong>）逛了一个多小时，随意买了一些东西。这里的商场几乎 100% 支持银联卡，70% 支持支付宝，除了和店员交流需要用 Google 翻译软件外，感受不到太大的与国内的差别。在 MUJI 配了两瓶熏香油——配合 MUJI 的熏香机使用。MUJI 的熏香油在国内似乎只卖调制完成的成品，在这里可以按照很详细的规则去自定义——店员会拿出大瓶的试剂原料和量杯现场调制。</p>
+<p><figure><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/11.jpg" alt="博物馆休馆"><figurecaption>博物馆休馆</figcaption></figure></p>
+<p>其实在新都心逛了蛮久，但是没有什么觉得很特别的值得记录下来的事情和情绪。从 MUJI 出来，才发现天已经暗了下来，路灯也亮起来了。晚上在 MUJI 前的麦当劳（<strong>マクドナルド 天久りうぼう楽市店</strong>）解决了晚餐。虽然日本的餐食比较贵，但是麦当劳的价格和国内基本是持平的：汉堡+薯条+饮料的组合折合成人民币在 40 元左右，算是非常廉价的餐食了。我独占了一张特别大的吧台上吃，吧台对面并排着几张小桌上围坐着六七个当地老人，活跃（有点激动）地交谈着什么。偶尔有客人从我旁边的小门进出，30 度的热浪卷到我的脸上，冲绳的夏天傍晚，竟然也是如此热情。</p>
+<p>走出麦当劳，夜晚稍稍有些深了，我不由地加快了步伐。似乎应该早点回酒店才是，这么想着，我拿出手机打开地图，找一条最近的步道回家。首先通过一座天桥穿过县立博物馆前的大路。这座天桥是新都心公园（<strong>新都心公園</strong>）的一部分，连接着黄金森公园（<strong>黄金森公園</strong>）。天色很暗，天桥上没有灯，头顶着蓝黑的天空和若隐若现的云层，脚底下是黑黢黢的树丛，诺大的天桥上只有我一个人。黄金森公园位于天桥另一端，也没有路灯，夜色中有三五个人牵着宠物狗在公园遛狗，似乎还在低声交谈着什么。白天一整天，都没有看到宠物在街道上，也许这个破败的小公园是当地宠物圈的「圣地」吧，我心里想。</p>
+<p><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/M3-j.jpg" alt=""></p>
+<p>后面的旅途就挺普通了，从一条小路拐上了 251 县道，沿着这条大路径直大步前行，二十分钟就回到了上午经过的这家 MaxValue 超市。我没有选择国际通，而是绕行了 MaxValue 背后的小道。行走在夜间的小道上，五十或一百米开外就是热闹的国际通路，花花绿绿的店铺中透出温暖的灯光，各种肤色的游客络绎不绝；但是我站的地方，路灯昏暗，人迹罕至，小车安静地趴在各家各户门前。在这种奇妙的氛围下，我终于回到了酒店，结束了今天的徒步行程。</p>
+<p><img src="http://xieguanglei.oss-cn-hangzhou.aliyuncs.com/blog-post/2019-7-20/M4-o.png" alt=""></p>
+<p>年纪渐长，有时候我会记不住上个月的事情，上周的事情，甚至记不住昨天发生的事情，我甚至开始写周记（顺便推荐一下 Day One 这个 App）来帮助记录生活中的点滴。但是这一天步行的所见所闻，直到半个月后的今天，很多细节依然仿佛就在眼前。这是为什么呢？我想了很久，终于想出了答案——那就是「孤独」的力量——这一天，我是孤独的（除了在雅马哈电器市场的那一个小时，是和我的同事王光九十一块儿逛的）。当我们浸没在日常的环境，日常的事情，日常的人物之中时，感官似乎会渐渐退化，对时间的流逝也渐渐麻木了；而这一天，远离杭州，远离工作，远离家人，当我一个人步行在一个完全陌生的地方时，我的眼睛、耳朵、鼻子又好像恢复了儿时的敏锐。不得不说，我很享受这份孤独——也许这也是一种旅行的意义吧。</p>
+]]></description>
+            <link>http://xieguanglei.github.io/blog/post/okinawa-naha-story.html</link>
+            <guid isPermaLink="false">okinawa-naha-story</guid>
+            <dc:creator><![CDATA[谢光磊]]></dc:creator>
+            <pubDate>Sat, 20 Jul 2019 00:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[SmallPT —— 99 行代码光线追踪解析]]></title>
+            <description><![CDATA[<h1 id="smallpt--99-行代码光线追踪解析">SmallPT —— 99 行代码光线追踪解析</h1>
+<p>光线追踪（Ray tracing）是三维计算机图形学中的特殊渲染算法：根据光路可逆原理，对每一个像素，沿着入射光线逆向追踪若干次反射、折射，进而计算此光线的颜色，把场景渲染出来。</p>
+<p>理论上，光线追踪算法可以完整地模拟物理世界中的光照，分毫不差地计算出每个像素的颜色，但是这样做的算力消耗趋近于正无穷。所以实际上所有光线追踪算法都包含了一些近似优化的逻辑，以将运算开销控制在可接受的数量级内。</p>
+<p><a href="http://rhythm.com/">Rhythm &amp; Hues Studios</a> 公司的程序员 <a href="http://kevinbeason.com/">Kevin Beason</a> 曾于 2010 年编写过一个名为 SmallPT 的 C++ <a href="http://www.kevinbeason.com/smallpt/">程序</a>，仅包含 99 行<a href="https://github.com/munificent/smallpt/blob/master/smallpt.cpp">代码</a>，即实现了最简单的光线追踪效果。此程序可视为光追算法的可运行最小集，是初学者学习和理解光追原理的极佳材料，其运行结果如下图所示。作为一个门外汉，我花了好几个晚上研究这 99 行代码，并在这个极好的 <a href="https://drive.google.com/file/d/0B8g97JkuSSBwUENiWTJXeGtTOHFmSm51UC01YWtCZw/view">PPT</a> 的帮助下，总算基本弄明白了其运行的原理。不妨记录下来：</p>
+<p><figure><img src="http://img.alicdn.com/tfs/TB1Hex0dqWs3KVjSZFxXXaWUXXa-640-480.jpg" alt="Small PT 程序运行结果"><figurecaption>Small PT 程序运行结果</figcaption></figure></p>
+<h2 id="渲染方程">渲染方程</h2>
+<p>还是从最基础的渲染方程开始：</p>
+<p>\begin{equation}L_o(o)=L_e(o)+\int_\Omega L_i(i)\cdot F(i, o)\cdot \cos\theta\cdot di \end{equation}</p>
+<p><img src="http://img.alicdn.com/tfs/TB19602dEKF3KVjSZFEXXXExFXa-504-189.png" alt=""></p>
+<p>解释：</p>
+<ol>
+<li>此方程描述的问题是：从物体表面上的一点 $P$。 处，射入到观察者眼中的某条光线的强度，是如何确定的。</li>
+<li>$L_o(o)$ 为射入观察者眼中的光线的颜色，即需要求取的值；$o$ 为出射方向。</li>
+<li>$L_e(o)$ 为物体表面在点 $P$ 向观察者方向自发射的光线的颜色（灯）。</li>
+<li>$L_i(i)$ 表示环境入射到点 $P$ 的光的颜色；$i$ <strong>代表</strong>入射方向（为计算方便，取真实入射方向的反方向，不影响<strong>代表</strong>关系，后面也简称为入射方向）。</li>
+<li>$F(i,o)$ 表示在给定 $i$ 和 $o$ 时，由 $i$ 方向的入射光产生的 $o$ 方向的出射光的强度，此函数与表面的性质有关，又称表面的 BRDF 函数。</li>
+<li>$\theta$ 表示 $i$ 与表面法线的夹角。</li>
+<li>$\int_\Omega L_i(i)\cdot F(i, o)\cdot \cos\theta\cdot di$ 整个积分项表示：对半球（不透明材质）或全球（透明介质）内的所有入射方向 $i$ 进行积分，得到的 $o$ 方向的出射光强度。</li>
+</ol>
+<p>依照光线追踪的原理，我们沿着 $o$ 方向追踪到一处交点 $P$，就需要进行一次积分操作。在计算机程序中，积分是用求和模拟的，求和的次数越多（自变量的间隔越小），结果就越准确。假设每次积分都要进行 $n$ 次求和操作，那么当追踪的光线遇到第一个交点时，会发散成 $n$ 条光线；同时追踪这 $n$ 条光线，到下一个交点，每条光线又会发散成 $n$ 条光线……随着追踪深度的增加，计算开销的量级将按照指数级上升。</p>
+<p><img src="https://img.alicdn.com/tfs/TB1qxN8dB1D3KVjSZFyXXbuFpXa-319-237.png" alt=""></p>
+<h2 id="蒙特卡洛方法">蒙特卡洛方法</h2>
+<p>蒙特卡洛方法（Monte Carlo method）是一种使用概率理论（通过大量随机数采样）进行数值计算以求取积分的方法。一个常用的有助理解的例子是：对「如何计算圆的面积」这个问题（圆的面积公式求取其实也是一个积分问题），蒙特卡洛的解法是「撒豆」：在包含圆的已知面积为 $S$ 的矩形内随机采样（撒豆）$N$ 次，统计豆在圆内的次数为 $M$，则圆的面积为 $S\cdot {M} / {N}$。</p>
+<p><img src="https://img.alicdn.com/tfs/TB1x2p8dBiE3KVjSZFMXXbQhVXa-251-251.png" alt=""></p>
+<blockquote>
+<p>撒豆问题不仅可以解圆的面积，还可以解任意形状，甚至不规则形状的面积求取。</p>
+</blockquote>
+<p>更具体地，蒙特卡洛方法可以表述为：</p>
+<p>\begin{equation}\int_{a}^{b} f(x)\cdot dx \approx \sum_{x=rand(a,b)}^{N} f(x) \cdot \frac{b-a}{N} \end{equation}</p>
+<ol>
+<li>左侧表示函数 $f(x)$ 在区间 $[a, b]$ 的积分，即下图中的部分阴影部分面积。</li>
+<li>此积分的值，可以这样求取：随机在 $[a, b]$ 区间取值，采样计算 $f(x)$，然后计算所有样本的均值并乘以区间的长度。当取样数量 $N$ 越大，最后的值就越接近真实的积分值。</li>
+</ol>
+<p><img src="https://img.alicdn.com/tfs/TB1CQ0_dEGF3KVjSZFmXXbqPXXa-338-303.png" alt=""></p>
+<p>有同学可能会问（我也曾有此困惑），为什么不直接均等分采样，而要随机采样呢？其实，对于计算一维的函数 $f(x)$，区别确实不大，但对二维甚至更高维度的函数（此时需要求取重积分）如 $f(x,y)$，情况就不一样了。</p>
+<p>\begin{equation}\int_{y_1}^{y_2} \int_{x_1}^{x_2} f(x, y)\cdot dxdy \approx \sum_{ \begin{matrix}x=rand(x_1,x_2) \\ y=rand(y_1,y_2)
+\end{matrix}  }^{N} f(x,y) \cdot \frac{(x_2-x_1)\cdot (y_2-y_1)}{N} \end{equation}</p>
+<p>此时，如果采取均等分采样，就需要选择在 $[x_1, x_2]$ 上均等分为若干份，选择在 $[y_1, y_2]$ 上均等分为若干份（其实撒豆问题已经是二维积分了，只不过积分函数是最简单的二值函数）。随着维度的增加，我们采样的数量也更难以控制，甚至还会出现维度不确定的情况。相比之下，蒙特卡洛方法的随机采样，可以轻易地控制或调整采样的次数：取两次（或更多次数的）随机数，可以视为<strong>单次</strong>随机行为，其背后包含的某种「随机性」是一致的。</p>
+<blockquote>
+<p>对于光线追踪而言，我们会追踪若干次反射或折射（这个次数又称深度），每一次反射或折射都需要进行一次采样，相当于增加了一个维度。如果每次采样的次数过多，随着深度的增加，总采样次数很快就会不可接受，而如果每次的采样次数过少，（直觉告诉我）那么第一次采样对后续的采样将造成比较大的偏差（这背后应该有更完整的数学解释）。而且，在光线追踪算法中，有时候是否继续进行采样取决于具体的采样值，这就让等分采样变得更加困难。实际上，这份光追算法的实现，在每次反射或折射时只取一个随机样本，而通过增加总总采样次数 $N$ 来保证最后的结果满足期望。</p>
+</blockquote>
+<h2 id="光线追踪算法">光线追踪算法</h2>
+<p>使用蒙特卡洛方法，对每一次反射或折射不再进行积分，而是随机选取一条可能的反射或折射光线进行追踪。然后在开始追踪的源头处，重复多次追踪操作以求取期望，这就是 SmallPT 光追的算法。简述一下具体步骤：</p>
+<p><img src="http://img.alicdn.com/tfs/TB1oQmfdAWE3KVjSZSyXXXocXXa-404-306.png" alt=""></p>
+<ol>
+<li>从每个像素 $P$ 处发出一条射线 $R$，其方向与入射到相机并产生该像素的光线相反。</li>
+<li>求取此射线照射到的物体表面的点 $P_1$，即与场景中物体的交点；如有多个交点，取距离相机最近的那个。如果未求到交点，则返回背景色。</li>
+<li>$P_1$ 射向 $P$ 的光线强度，为 $P_1$ 本身发射光强度 $E$，加上反射或折射环境光的强度。<ol>
+<li>$E$：如果 $P_1$ 处是光源，则 $E$ 为光源的强度；否则，$E$ 为 0。</li>
+<li>$R_1$：根据 $P_1$ 处根据表面性质，按概率随机取<strong>一次</strong>反射的射线 $R_2$，然后重复 2 的步骤，分别递归地求取 $P_2$，$R_3$，$P_3$，$R_4$ ……等等，直到满足一些特定条件停止递归。</li>
+</ol>
+</li>
+</ol>
+<p>以上便是单个像素的光追的算法。对单个像素，重复大量的次数求取平均值，作为此像素的颜色。</p>
+<p>对每个像素完成以上步骤，就渲染出了整幅图像。</p>
+<h2 id="代码摘录">代码摘录</h2>
+<p>完整的代码摘抄如下：</p>
+<pre><code class="language-cpp"><span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;math.h&gt;   // smallpt, a Path Tracer by Kevin Beason, 2008</span></span>
+<span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;stdlib.h&gt; // Make : g++ -O3 -fopenmp smallpt.cpp -o smallpt</span></span>
+<span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;stdio.h&gt;  //        Remove "-fopenmp" for g++ version &lt; 4.2</span></span>
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Vec</span> {</span>        <span class="hljs-comment">// Usage: time ./smallpt 5000 &amp;&amp; xv image.ppm</span>
+  <span class="hljs-keyword">double</span> x, y, z;                  <span class="hljs-comment">// position, also color (r,g,b)</span>
+  Vec(<span class="hljs-keyword">double</span> x_=<span class="hljs-number">0</span>, <span class="hljs-keyword">double</span> y_=<span class="hljs-number">0</span>, <span class="hljs-keyword">double</span> z_=<span class="hljs-number">0</span>){ x=x_; y=y_; z=z_; }
+  Vec <span class="hljs-keyword">operator</span>+(<span class="hljs-keyword">const</span> Vec &amp;b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x+b.x,y+b.y,z+b.z); }
+  Vec <span class="hljs-keyword">operator</span>-(<span class="hljs-keyword">const</span> Vec &amp;b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x-b.x,y-b.y,z-b.z); }
+  Vec <span class="hljs-keyword">operator</span>*(<span class="hljs-keyword">double</span> b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x*b,y*b,z*b); }
+  <span class="hljs-function">Vec <span class="hljs-title">mult</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Vec &amp;b)</span> <span class="hljs-keyword">const</span> </span>{ <span class="hljs-keyword">return</span> Vec(x*b.x,y*b.y,z*b.z); }
+  <span class="hljs-function">Vec&amp; <span class="hljs-title">norm</span><span class="hljs-params">()</span></span>{ <span class="hljs-keyword">return</span> *<span class="hljs-keyword">this</span> = *<span class="hljs-keyword">this</span> * (<span class="hljs-number">1</span>/<span class="hljs-built_in">sqrt</span>(x*x+y*y+z*z)); }
+  <span class="hljs-function"><span class="hljs-keyword">double</span> <span class="hljs-title">dot</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Vec &amp;b)</span> <span class="hljs-keyword">const</span> </span>{ <span class="hljs-keyword">return</span> x*b.x+y*b.y+z*b.z; } <span class="hljs-comment">// cross:</span>
+  Vec <span class="hljs-keyword">operator</span>%(Vec&amp;b){<span class="hljs-keyword">return</span> Vec(y*b.z-z*b.y,z*b.x-x*b.z,x*b.y-y*b.x);}
+};
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Ray</span> {</span> Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
+<span class="hljs-keyword">enum</span> Refl_t { DIFF, SPEC, REFR };  <span class="hljs-comment">// material types, used in radiance()</span>
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Sphere</span> {</span>
+  <span class="hljs-keyword">double</span> rad;       <span class="hljs-comment">// radius</span>
+  Vec p, e, c;      <span class="hljs-comment">// position, emission, color</span>
+  Refl_t refl;      <span class="hljs-comment">// reflection type (DIFFuse, SPECular, REFRactive)</span>
+  Sphere(<span class="hljs-keyword">double</span> rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_):
+  rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
+  <span class="hljs-function"><span class="hljs-keyword">double</span> <span class="hljs-title">intersect</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Ray &amp;r)</span> <span class="hljs-keyword">const</span> </span>{ <span class="hljs-comment">// returns distance, 0 if nohit</span>
+    Vec op = p-r.o; <span class="hljs-comment">// Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0</span>
+    <span class="hljs-keyword">double</span> t, eps=<span class="hljs-number">1e-4</span>, b=op.dot(r.d), det=b*b-op.dot(op)+rad*rad;
+    <span class="hljs-keyword">if</span> (det&lt;<span class="hljs-number">0</span>) <span class="hljs-keyword">return</span> <span class="hljs-number">0</span>; <span class="hljs-keyword">else</span> det=<span class="hljs-built_in">sqrt</span>(det);
+      <span class="hljs-keyword">return</span> (t=b-det)&gt;eps ? t : ((t=b+det)&gt;eps ? t : <span class="hljs-number">0</span>);
+  }
+};
+Sphere spheres[] = {<span class="hljs-comment">//Scene: radius, position, emission, color, material</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec( <span class="hljs-number">1e5</span>+<span class="hljs-number">1</span>,<span class="hljs-number">40.8</span>,<span class="hljs-number">81.6</span>), Vec(),Vec(<span class="hljs-number">.75</span>,<span class="hljs-number">.25</span>,<span class="hljs-number">.25</span>),DIFF),<span class="hljs-comment">//Left</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec(<span class="hljs-number">-1e5</span>+<span class="hljs-number">99</span>,<span class="hljs-number">40.8</span>,<span class="hljs-number">81.6</span>),Vec(),Vec(<span class="hljs-number">.25</span>,<span class="hljs-number">.25</span>,<span class="hljs-number">.75</span>),DIFF),<span class="hljs-comment">//Rght</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec(<span class="hljs-number">50</span>,<span class="hljs-number">40.8</span>, <span class="hljs-number">1e5</span>),     Vec(),Vec(<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>),DIFF),<span class="hljs-comment">//Back</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec(<span class="hljs-number">50</span>,<span class="hljs-number">40.8</span>,<span class="hljs-number">-1e5</span>+<span class="hljs-number">170</span>), Vec(),Vec(),           DIFF),<span class="hljs-comment">//Frnt</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec(<span class="hljs-number">50</span>, <span class="hljs-number">1e5</span>, <span class="hljs-number">81.6</span>),    Vec(),Vec(<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>),DIFF),<span class="hljs-comment">//Botm</span>
+  Sphere(<span class="hljs-number">1e5</span>, Vec(<span class="hljs-number">50</span>,<span class="hljs-number">-1e5</span>+<span class="hljs-number">81.6</span>,<span class="hljs-number">81.6</span>),Vec(),Vec(<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>,<span class="hljs-number">.75</span>),DIFF),<span class="hljs-comment">//Top</span>
+  Sphere(<span class="hljs-number">16.5</span>,Vec(<span class="hljs-number">27</span>,<span class="hljs-number">16.5</span>,<span class="hljs-number">47</span>),       Vec(),Vec(<span class="hljs-number">1</span>,<span class="hljs-number">1</span>,<span class="hljs-number">1</span>)*<span class="hljs-number">.999</span>, SPEC),<span class="hljs-comment">//Mirr</span>
+  Sphere(<span class="hljs-number">16.5</span>,Vec(<span class="hljs-number">73</span>,<span class="hljs-number">16.5</span>,<span class="hljs-number">78</span>),       Vec(),Vec(<span class="hljs-number">1</span>,<span class="hljs-number">1</span>,<span class="hljs-number">1</span>)*<span class="hljs-number">.999</span>, REFR),<span class="hljs-comment">//Glas</span>
+  Sphere(<span class="hljs-number">600</span>, Vec(<span class="hljs-number">50</span>,<span class="hljs-number">681.6</span><span class="hljs-number">-.27</span>,<span class="hljs-number">81.6</span>),Vec(<span class="hljs-number">12</span>,<span class="hljs-number">12</span>,<span class="hljs-number">12</span>),  Vec(), DIFF) <span class="hljs-comment">//Lite</span>
+};
+<span class="hljs-function"><span class="hljs-keyword">inline</span> <span class="hljs-keyword">double</span> <span class="hljs-title">clamp</span><span class="hljs-params">(<span class="hljs-keyword">double</span> x)</span></span>{ <span class="hljs-keyword">return</span> x&lt;<span class="hljs-number">0</span> ? <span class="hljs-number">0</span> : x&gt;<span class="hljs-number">1</span> ? <span class="hljs-number">1</span> : x; }
+<span class="hljs-function"><span class="hljs-keyword">inline</span> <span class="hljs-keyword">int</span> <span class="hljs-title">toInt</span><span class="hljs-params">(<span class="hljs-keyword">double</span> x)</span></span>{ <span class="hljs-keyword">return</span> <span class="hljs-keyword">int</span>(<span class="hljs-built_in">pow</span>(clamp(x),<span class="hljs-number">1</span>/<span class="hljs-number">2.2</span>)*<span class="hljs-number">255</span>+<span class="hljs-number">.5</span>); }
+<span class="hljs-function"><span class="hljs-keyword">inline</span> <span class="hljs-keyword">bool</span> <span class="hljs-title">intersect</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Ray &amp;r, <span class="hljs-keyword">double</span> &amp;t, <span class="hljs-keyword">int</span> &amp;id)</span></span>{
+  <span class="hljs-keyword">double</span> n=<span class="hljs-keyword">sizeof</span>(spheres)/<span class="hljs-keyword">sizeof</span>(Sphere), d, inf=t=<span class="hljs-number">1e20</span>;
+  <span class="hljs-keyword">for</span>(<span class="hljs-keyword">int</span> i=<span class="hljs-keyword">int</span>(n);i--;) <span class="hljs-keyword">if</span>((d=spheres[i].intersect(r))&amp;&amp;d&lt;t){t=d;id=i;}
+  <span class="hljs-keyword">return</span> t&lt;inf;
+}
+<span class="hljs-function">Vec <span class="hljs-title">radiance</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Ray &amp;r, <span class="hljs-keyword">int</span> depth, <span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">short</span> *Xi)</span></span>{
+  <span class="hljs-keyword">double</span> t;                               <span class="hljs-comment">// distance to intersection</span>
+  <span class="hljs-keyword">int</span> id=<span class="hljs-number">0</span>;                               <span class="hljs-comment">// id of intersected object</span>
+  <span class="hljs-keyword">if</span> (!intersect(r, t, id)) <span class="hljs-keyword">return</span> Vec(); <span class="hljs-comment">// if miss, return black</span>
+  <span class="hljs-keyword">const</span> Sphere &amp;obj = spheres[id];        <span class="hljs-comment">// the hit object</span>
+  Vec x=r.o+r.d*t, n=(x-obj.p).norm(), nl=n.dot(r.d)&lt;<span class="hljs-number">0</span>?n:n*<span class="hljs-number">-1</span>, f=obj.c;
+  <span class="hljs-keyword">double</span> p = f.x&gt;f.y &amp;&amp; f.x&gt;f.z ? f.x : f.y&gt;f.z ? f.y : f.z; <span class="hljs-comment">// max refl</span>
+  <span class="hljs-keyword">if</span> (++depth&gt;<span class="hljs-number">5</span>) <span class="hljs-keyword">if</span> (erand48(Xi)&lt;p) f=f*(<span class="hljs-number">1</span>/p); <span class="hljs-keyword">else</span> <span class="hljs-keyword">return</span> obj.e; <span class="hljs-comment">//R.R.</span>
+  <span class="hljs-keyword">if</span> (obj.refl == DIFF){                  <span class="hljs-comment">// Ideal DIFFUSE reflection</span>
+    <span class="hljs-keyword">double</span> r1=<span class="hljs-number">2</span>*M_PI*erand48(Xi), r2=erand48(Xi), r2s=<span class="hljs-built_in">sqrt</span>(r2);
+    Vec w=nl, u=((<span class="hljs-built_in">fabs</span>(w.x)&gt;<span class="hljs-number">.1</span>?Vec(<span class="hljs-number">0</span>,<span class="hljs-number">1</span>):Vec(<span class="hljs-number">1</span>))%w).norm(), v=w%u;
+    Vec d = (u*<span class="hljs-built_in">cos</span>(r1)*r2s + v*<span class="hljs-built_in">sin</span>(r1)*r2s + w*<span class="hljs-built_in">sqrt</span>(<span class="hljs-number">1</span>-r2)).norm();
+    <span class="hljs-keyword">return</span> obj.e + f.mult(radiance(Ray(x,d),depth,Xi));
+  } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (obj.refl == SPEC)            <span class="hljs-comment">// Ideal SPECULAR reflection</span>
+    <span class="hljs-keyword">return</span> obj.e + f.mult(radiance(Ray(x,r.d-n*<span class="hljs-number">2</span>*n.dot(r.d)),depth,Xi));
+  <span class="hljs-function">Ray <span class="hljs-title">reflRay</span><span class="hljs-params">(x, r.d-n*<span class="hljs-number">2</span>*n.dot(r.d))</span></span>;     <span class="hljs-comment">// Ideal dielectric REFRACTION</span>
+  <span class="hljs-keyword">bool</span> into = n.dot(nl)&gt;<span class="hljs-number">0</span>;                <span class="hljs-comment">// Ray from outside going in?</span>
+  <span class="hljs-keyword">double</span> nc=<span class="hljs-number">1</span>, nt=<span class="hljs-number">1.5</span>, nnt=into?nc/nt:nt/nc, ddn=r.d.dot(nl), cos2t;
+  <span class="hljs-keyword">if</span> ((cos2t=<span class="hljs-number">1</span>-nnt*nnt*(<span class="hljs-number">1</span>-ddn*ddn))&lt;<span class="hljs-number">0</span>)    <span class="hljs-comment">// Total internal reflection</span>
+    <span class="hljs-keyword">return</span> obj.e + f.mult(radiance(reflRay,depth,Xi));
+  Vec tdir = (r.d*nnt - n*((into?<span class="hljs-number">1</span>:<span class="hljs-number">-1</span>)*(ddn*nnt+<span class="hljs-built_in">sqrt</span>(cos2t)))).norm();
+  <span class="hljs-keyword">double</span> a=nt-nc, b=nt+nc, R0=a*a/(b*b), c = <span class="hljs-number">1</span>-(into?-ddn:tdir.dot(n));
+  <span class="hljs-keyword">double</span> Re=R0+(<span class="hljs-number">1</span>-R0)*c*c*c*c*c,Tr=<span class="hljs-number">1</span>-Re,P=<span class="hljs-number">.25</span>+<span class="hljs-number">.5</span>*Re,RP=Re/P,TP=Tr/(<span class="hljs-number">1</span>-P);
+  <span class="hljs-keyword">return</span> obj.e + f.mult(depth&gt;<span class="hljs-number">2</span> ? (erand48(Xi)&lt;P ? <span class="hljs-comment">// Russian roulette</span>
+    radiance(reflRay,depth,Xi)*RP:radiance(Ray(x,tdir),depth,Xi)*TP) :
+    radiance(reflRay,depth,Xi)*Re+radiance(Ray(x,tdir),depth,Xi)*Tr);
+}
+<span class="hljs-function"><span class="hljs-keyword">int</span> <span class="hljs-title">main</span><span class="hljs-params">(<span class="hljs-keyword">int</span> argc, <span class="hljs-keyword">char</span> *argv[])</span></span>{
+  <span class="hljs-keyword">int</span> w=<span class="hljs-number">1024</span>/<span class="hljs-number">8</span>, h=<span class="hljs-number">768</span>/<span class="hljs-number">8</span>, samps = argc==<span class="hljs-number">2</span> ? atoi(argv[<span class="hljs-number">1</span>])/<span class="hljs-number">4</span> : <span class="hljs-number">30</span>;
+  <span class="hljs-function">Ray <span class="hljs-title">cam</span><span class="hljs-params">(Vec(<span class="hljs-number">50</span>,<span class="hljs-number">52</span>,<span class="hljs-number">295.6</span>), Vec(<span class="hljs-number">0</span>,<span class="hljs-number">-0.042612</span>,<span class="hljs-number">-1</span>).norm())</span></span>; <span class="hljs-comment">// cam pos, dir</span>
+  Vec cx=Vec(w*<span class="hljs-number">.5135</span>/h), cy=(cx%cam.d).norm()*<span class="hljs-number">.5135</span>, r, *c=<span class="hljs-keyword">new</span> Vec[w*h];
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> y=<span class="hljs-number">0</span>; y&lt;h; y++){                       <span class="hljs-comment">// Loop over image rows</span>
+    <span class="hljs-built_in">fprintf</span>(<span class="hljs-built_in">stderr</span>,<span class="hljs-string">"\rRendering (%d spp) %5.2f%%"</span>,samps*<span class="hljs-number">4</span>,<span class="hljs-number">100.</span>*y/(h<span class="hljs-number">-1</span>));
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">short</span> x=<span class="hljs-number">0</span>, Xi[<span class="hljs-number">3</span>]={<span class="hljs-number">0</span>,<span class="hljs-number">0</span>,(<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">short</span>)(y*y*y)}; x&lt;w; x++)
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> sy=<span class="hljs-number">0</span>, i=(h-y<span class="hljs-number">-1</span>)*w+x; sy&lt;<span class="hljs-number">2</span>; sy++)     <span class="hljs-comment">// 2x2 subpixel rows</span>
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> sx=<span class="hljs-number">0</span>; sx&lt;<span class="hljs-number">2</span>; sx++, r=Vec()){        <span class="hljs-comment">// 2x2 subpixel cols</span>
+          <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> s=<span class="hljs-number">0</span>; s&lt;samps; s++){
+            <span class="hljs-keyword">double</span> r1=<span class="hljs-number">2</span>*erand48(Xi), dx=r1&lt;<span class="hljs-number">1</span> ? <span class="hljs-built_in">sqrt</span>(r1)<span class="hljs-number">-1</span>: <span class="hljs-number">1</span>-<span class="hljs-built_in">sqrt</span>(<span class="hljs-number">2</span>-r1);
+            <span class="hljs-keyword">double</span> r2=<span class="hljs-number">2</span>*erand48(Xi), dy=r2&lt;<span class="hljs-number">1</span> ? <span class="hljs-built_in">sqrt</span>(r2)<span class="hljs-number">-1</span>: <span class="hljs-number">1</span>-<span class="hljs-built_in">sqrt</span>(<span class="hljs-number">2</span>-r2);
+            Vec d = cx*( ( (sx+<span class="hljs-number">.5</span> + dx)/<span class="hljs-number">2</span> + x)/w - <span class="hljs-number">.5</span>) +
+            cy*( ( (sy+<span class="hljs-number">.5</span> + dy)/<span class="hljs-number">2</span> + y)/h - <span class="hljs-number">.5</span>) + cam.d;
+            r = r + radiance(Ray(cam.o+d*<span class="hljs-number">140</span>,d.norm()),<span class="hljs-number">0</span>,Xi)*(<span class="hljs-number">1.</span>/samps);
+          } <span class="hljs-comment">// Camera rays are pushed ^^^^^ forward to start in interior</span>
+          c[i] = c[i] + Vec(clamp(r.x),clamp(r.y),clamp(r.z))*<span class="hljs-number">.25</span>;
+        }
+  }
+  FILE *f = fopen(<span class="hljs-string">"image.ppm"</span>, <span class="hljs-string">"w"</span>);         <span class="hljs-comment">// Write image to PPM file.</span>
+  <span class="hljs-built_in">fprintf</span>(f, <span class="hljs-string">"P3\n%d %d\n%d\n"</span>, w, h, <span class="hljs-number">255</span>);
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i=<span class="hljs-number">0</span>; i&lt;w*h; i++)
+    <span class="hljs-built_in">fprintf</span>(f,<span class="hljs-string">"%d %d %d "</span>, toInt(c[i].x), toInt(c[i].y), toInt(c[i].z));
+}</code></pre>
+<p>本文的主要部分，就是对这段代码的解析：</p>
+<h2 id="矢量运算">矢量运算</h2>
+<p>定义 <code>Vec</code> 结构体描述三维矢量，重载运算符来实现矢量运算。</p>
+<pre><code class="language-cpp"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Vec</span> {</span>
+  <span class="hljs-keyword">double</span> x, y, z;
+  Vec(<span class="hljs-keyword">double</span> x_=<span class="hljs-number">0</span>, <span class="hljs-keyword">double</span> y_=<span class="hljs-number">0</span>, <span class="hljs-keyword">double</span> z_=<span class="hljs-number">0</span>){ x=x_; y=y_; z=z_; }
+  Vec <span class="hljs-keyword">operator</span>+(<span class="hljs-keyword">const</span> Vec &amp;b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x+b.x,y+b.y,z+b.z); }
+  Vec <span class="hljs-keyword">operator</span>-(<span class="hljs-keyword">const</span> Vec &amp;b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x-b.x,y-b.y,z-b.z); }
+  Vec <span class="hljs-keyword">operator</span>*(<span class="hljs-keyword">double</span> b) <span class="hljs-keyword">const</span> { <span class="hljs-keyword">return</span> Vec(x*b,y*b,z*b); }
+  <span class="hljs-function">Vec <span class="hljs-title">mult</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Vec &amp;b)</span> <span class="hljs-keyword">const</span> </span>{ <span class="hljs-keyword">return</span> Vec(x*b.x,y*b.y,z*b.z); }
+  <span class="hljs-function">Vec&amp; <span class="hljs-title">norm</span><span class="hljs-params">()</span></span>{ <span class="hljs-keyword">return</span> *<span class="hljs-keyword">this</span> = *<span class="hljs-keyword">this</span> * (<span class="hljs-number">1</span>/<span class="hljs-built_in">sqrt</span>(x*x+y*y+z*z)); }
+  <span class="hljs-function"><span class="hljs-keyword">double</span> <span class="hljs-title">dot</span><span class="hljs-params">(<span class="hljs-keyword">const</span> Vec &amp;b)</span> <span class="hljs-keyword">const</span> </span>{ <span class="hljs-keyword">return</span> x*b.x+y*b.y+z*b.z; }
+  Vec <span class="hljs-keyword">operator</span>%(Vec&amp;b){<span class="hljs-keyword">return</span> Vec(y*b.z-z*b.y,z*b.x-x*b.z,x*b.y-y*b.x);}
+};</code></pre>
+<p>矢量运算包括（假设 $V_1=(x_1, y_1, z_1)$；$V_2=(x_2,y_2,z_2)$）：</p>
+<ol>
+<li>加法 <code>operator+</code>：$V_1+V_2=(x_1+x_2,y_1+y_2,z_1+z_2)$。</li>
+<li>减法 <code>operator-</code>：$V_1-V_2=(x_1-x_2,y_1-y_2,z_1-z_2)$。</li>
+<li>乘法 <code>mult()</code>：$mult(V_1, V_2)=(x_1 x_2,y_1 y_2,z_1 z_2)$。这种矢量分量直接相乘的运算通常用于颜色的计算，在三维空间中并无特殊的物理意义。</li>
+<li>点乘 <code>dot()</code>：$V_1\cdot V_2 = (x_1 x_2 + y_1 y_2 + z_1 z_2) = \cos\theta$，其中 $\theta$ 为 $V_1$ 与 $V_2$ 的夹角。点乘的结果是一个标量，物理含义是 $V_1$ 在 $V_2$ 方向上的投影。</li>
+<li>叉乘 <code>operator%</code>：$V_1\times V_2 = (y_1 z_2 - z_1 y_2, z_1 x_2 - x_1 z_2, x_1 y_2 - y_1 x_2)$，叉乘的结果是一个矢量，物理意义是垂直于 $V_1$ 和 $V_2$ 的矢量（按 $V_1\rightarrow V_2$ 顺序右手螺旋），其长度为 $V_1$ 和 $V_2$ 构成的平行四边形面积。</li>
+<li>矢量乘以标量 <code>operator*</code>：$V_1 * b = (x_1 b, y_1 b, z_1 b)$。</li>
+<li>归一化 <code>norm()</code>：$norm(V_1) = V_1 * \frac{1}{\sqrt {x_1^2+y_1^2+z_1^2}}$，其物理意义是保持矢量方向不变，将其长度缩放为单位长度 1。</li>
+</ol>
+<p><img src="http://img.alicdn.com/tfs/TB1S5indBWD3KVjSZKPXXap7FXa-529-277.png" alt=""></p>
+<h2 id="射线">射线</h2>
+<p>通过定义射线的出射点 $o$ 和出射方向 $d$ 来定义射线：</p>
+<pre><code class="language-cpp"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Ray</span> {</span> Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };</code></pre>
+<p><img src="https://img.alicdn.com/tfs/TB1rxmmdvWG3KVjSZFgXXbTspXa-298-123.png" alt=""></p>
+<h2 id="定义场景">定义场景</h2>
+<p>如前文 SmallPT 的渲染效果图所示，整个场景由一个房间，一个光源和两个球体组成。为了简单，SmallPT 将场景全部用球体来表示，房间的墙壁就用直径极大（使观者感受不到墙壁是弯曲的）的球体来表示。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1V8mHdBCw3KVjSZFlXXcJkFXa-226-175.png" alt=""></p>
+<h3 id="球体对象的表示">球体对象的表示</h3>
+<ol>
+<li>首先枚举出三种表面特性：散射面——用于墙壁，镜面——用于左侧的镜面小球，折射面——用于右侧的玻璃小球。</li>
+<li>定义球体，内容包括：<ol>
+<li>数值类型成员：半径 $rad$；</li>
+<li>矢量类型成员：圆心位置 $p$，表面发光强度（颜色）$e$，表面散射颜色 $c$；</li>
+<li>表面特性 $refl$；</li>
+</ol>
+</li>
+</ol>
+<pre><code class="language-cpp"><span class="hljs-keyword">enum</span> Refl_t { DIFF, SPEC, REFR };  <span class="hljs-comment">// material types, used in radiance()</span>
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">Sphere</span> {</span>
+  <span class="hljs-keyword">double</span> rad;       <span class="hljs-comment">// radius</span>
+  Vec p, e, c;      <span class="hljs-comment">// position, emission, color</span>
+  Refl_t refl;      <span class="hljs-comment">// reflection type (DIFFuse, SPECular, REFRactive)</span>
+  Sphere(<span class="hljs-keyword">double</span> rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_):
+  rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
+  <span class="hljs-comment">// ...</span>
+};</code></pre>
+<h3 id="射线与球体相交">射线与球体相交</h3>
+<p><code>Sphere</code> 上定义了 <code>intersect</code> 方法，以求取给定的射线与球体是不是相交。如果相交则返回射线原点与交点的距离。</p>
+<pre><code class="language-c">double intersect(const Ray &amp;r) const { // returns distance, 0 if nohit
+  Vec op = p-r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
+  double t, eps=1e-4, b=op.dot(r.d), det=b*b-op.dot(op)+rad*rad;
+  if (det&lt;0) return 0; else det=sqrt(det);
+    return (t=b-det)&gt;eps ? t : ((t=b+det)&gt;eps ? t : 0);
+}</code></pre>
+<p><img src="http://img.alicdn.com/tfs/TB1tA1Sckxz61VjSZFtXXaDSVXa-430-152.png" alt=""></p>
+<p>注意，下面为了清楚，我们使用大写字母为矢量，小写字母为标量来进行推导。我们需要求解的是射线的原点 $O$ 与交点 $X$ 的距离 $t$，而条件是：</p>
+<ol>
+<li>$X$ 点在射线上，即 $X=O+D*t$。</li>
+<li>$X$ 点在球面上，即 $X$ 与球心 $P$ 的距离等于球的半径 。即 $|X-P|=r$，也就是 $(X-P)^2=r^2$。</li>
+</ol>
+<p>将 (1) 中关于 $X$ 的表达式代入 (2)，得到：</p>
+<p>\begin{equation}(O+D*t-P)^2=r^2\end{equation}</p>
+<p>展开得到：</p>
+<p>\begin{equation}D^2*t+2(O-P)\cdot D*t+(O-P)^2-r^2=0\end{equation}</p>
+<p>这已经是一个一元二次方程，自变量 $t$ 是未知的。所有矢量经过平方或点积后都成为了标量，可以直接根据一元二次方程 $ax^2+bx+c=0$ 的求根公式：</p>
+<p>\begin{equation}x=\frac{-b\pm \sqrt{b^2-4ac}}{2 a}\end{equation}</p>
+<p>计算出根 $t$。</p>
+<ol>
+<li>一元二次方程可能没有实根的，此时射线与球体不相交。这对应着代码中 <code>det&lt;0</code> 的情况，直接返回 0。</li>
+<li>一元二次方程可能有两个实根，此时射线（所在的直线）与球体有两个交点。我们需要取的是<strong>最小的正根</strong>。如果另一个根 $t&#39;$（对应交点为 $X&#39;$）大于 $t$，表明是左图的情况；如果 $t&#39;$ 小于等于 0，表明是右图的情况，这条光线是在介质内的折射光线。</li>
+</ol>
+<h3 id="使用球体表示场景">使用球体表示场景</h3>
+<p>代码定义了一个 <code>spheres</code> 数组来表达整个场景，每一个球体分别是：</p>
+<ol>
+<li>左侧墙体，红色；墙体的半径都很大，观者感知不到曲率；墙体的反射类型都是散射，但是颜色有所不同。</li>
+<li>右侧墙体，蓝色。</li>
+<li>后面墙体，灰色。</li>
+<li>前面墙体，黑色。</li>
+<li>底部墙体，灰色。</li>
+<li>顶部墙体，灰色。</li>
+<li>左侧球体，镜面材质。</li>
+<li>右侧球体，透明玻璃材质，光线可能折射进入玻璃中继续传播。</li>
+<li>顶部的光源，发射出强度为 12 的白光。</li>
+</ol>
+<pre><code class="language-c">Sphere spheres[] = { //Scene: radius, position, emission, color, material
+  Sphere(1e5, Vec( 1e5+1,40.8,81.6), Vec(),Vec(.75,.25,.25),DIFF),//Left
+  Sphere(1e5, Vec(-1e5+99,40.8,81.6),Vec(),Vec(.25,.25,.75),DIFF),//Rght
+  Sphere(1e5, Vec(50,40.8, 1e5),     Vec(),Vec(.75,.75,.75),DIFF),//Back
+  Sphere(1e5, Vec(50,40.8,-1e5+170), Vec(),Vec(),           DIFF),//Frnt
+  Sphere(1e5, Vec(50, 1e5, 81.6),    Vec(),Vec(.75,.75,.75),DIFF),//Botm
+  Sphere(1e5, Vec(50,-1e5+81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF),//Top
+  Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC),//Mirr
+  Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR),//Glas
+  Sphere(600, Vec(50,681.6-.27,81.6),Vec(12,12,12),  Vec(), DIFF) //Lite
+};</code></pre>
+<p>可以看出，坐标轴的原点位于盒子的左面、后面和底面的交点附近。宽度 100 左右，高度 80 左右，深度 170 左右。</p>
+<h2 id="准备渲染">准备渲染</h2>
+<p>在真正开始渲染之前，还需要做一些准备工作。</p>
+<h3 id="确定相机和输出图像">确定相机和输出图像</h3>
+<p>先跳过 <code>clamp</code>，<code>toInt</code>，<code>radiance</code> 这几个函数，直接来看 <code>main</code> 函数。</p>
+<pre><code class="language-cpp"><span class="hljs-function"><span class="hljs-keyword">int</span> <span class="hljs-title">main</span><span class="hljs-params">(<span class="hljs-keyword">int</span> argc, <span class="hljs-keyword">char</span> *argv[])</span></span>{
+  <span class="hljs-keyword">int</span> w=<span class="hljs-number">1024</span>, h=<span class="hljs-number">768</span>, samps = argc==<span class="hljs-number">2</span> ? atoi(argv[<span class="hljs-number">1</span>])/<span class="hljs-number">4</span> : <span class="hljs-number">30</span>;
+  <span class="hljs-function">Ray <span class="hljs-title">cam</span><span class="hljs-params">(Vec(<span class="hljs-number">50</span>,<span class="hljs-number">52</span>,<span class="hljs-number">295.6</span>), Vec(<span class="hljs-number">0</span>,<span class="hljs-number">-0.042612</span>,<span class="hljs-number">-1</span>).norm())</span></span>; <span class="hljs-comment">// cam pos, dir</span>
+  Vec cx=Vec(w*<span class="hljs-number">.5135</span>/h), cy=(cx%cam.d).norm()*<span class="hljs-number">.5135</span>, r, *c=<span class="hljs-keyword">new</span> Vec[w*h];
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> y=<span class="hljs-number">0</span>; y&lt;h; y++){                       <span class="hljs-comment">// Loop over image rows</span>
+    <span class="hljs-built_in">fprintf</span>(<span class="hljs-built_in">stderr</span>,<span class="hljs-string">"\rRendering (%d spp) %5.2f%%"</span>,samps*<span class="hljs-number">4</span>,<span class="hljs-number">100.</span>*y/(h<span class="hljs-number">-1</span>));
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">short</span> x=<span class="hljs-number">0</span>, Xi[<span class="hljs-number">3</span>]={<span class="hljs-number">0</span>,<span class="hljs-number">0</span>,(<span class="hljs-keyword">unsigned</span> <span class="hljs-keyword">short</span>)(y*y*y)}; x&lt;w; x++)
+      <span class="hljs-comment">// ... 暂时先省略</span>
+  }
+  FILE *f = fopen(<span class="hljs-string">"image.ppm"</span>, <span class="hljs-string">"w"</span>);         <span class="hljs-comment">// Write image to PPM file.</span>
+  <span class="hljs-built_in">fprintf</span>(f, <span class="hljs-string">"P3\n%d %d\n%d\n"</span>, w, h, <span class="hljs-number">255</span>);
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> i=<span class="hljs-number">0</span>; i&lt;w*h; i++)
+    <span class="hljs-built_in">fprintf</span>(f,<span class="hljs-string">"%d %d %d "</span>, toInt(c[i].x), toInt(c[i].y), toInt(c[i].z));
+}</code></pre>
+<p>首先，定义需要渲染图像的宽度（1024），高度（768），对每个像素的采样次数（命令行参数传入，或 120 次）。注意，变量 <code>samps</code> 的值是采样次数的 1/4，在这个例子中，最终渲染在图像上的每一个像素，又会拆分成 4 个子像素进行追踪和采样，而 <code>samps</code> 的值是子像素的采样次数。</p>
+<p>然后，使用射线类的变量 <code>cam</code> 来表示相机，射线的原点 <code>cam.o</code> 即是相机的位置，而射线的方向 <code>cam.d</code> 是相机朝向的方向。由于相机本身的位置只是一个点，所以需要把渲染出的图像视为在屏幕前方（亦或是后方，参考一下眼球和相机的构造）不远处的一块矩形幕布，抵达相机的光线穿透幕布时会在与幕布的交点 $P$ 处留下颜色，这样就在幕布上投影了。只要幕布的分辨率和宽高比不变，其距离相机的远近与最终结果是无关的，所以程序直接设定幕布与相机的距离是 1，设定幕布本身的高度为 0.5135（配合像素尺寸的宽高比，其实这里已经暗含了相机的水平和垂直视场角的信息）。然后，求取长度等于幕布真实宽度 <code>0.5135*w/h</code> 的水平矢量 <code>cx</code>（平行于 X 轴），求取长度等于幕布真实高度 <code>0.5135</code> 的垂直矢量 <code>cy</code>（通过 <code>cx</code> 与 <code>cam.d</code> 叉乘而来）。</p>
+<p><img src="https://img.alicdn.com/tfs/TB1QZQydEKF3KVjSZFEXXXExFXa-237-277.png" alt=""></p>
+<p>再接着，生成长度为 <code>w*h</code> 的 <code>Vec</code> 类型数组 <code>c</code> 备用。这个数组的作用是存储渲染的结果。</p>
+<p>最后，遍历宽度和高度，对每一个像素进行渲染，并将渲染得到值写入到数组 <code>c</code> 中，并将其输出为 PPM 格式的图片，以便打开查看渲染效果。</p>
+<blockquote>
+<p>PPM 是一种基于文本的图片格式，能够帮助你避免考虑图片文件编码问题，轻易地按像素输出图片。比如以下文本内容就是一张 4x4 的图片。</p>
+<pre><code>P3
+# feep.ppm
+4 4
+15
+ 0  0  0    0  0  0    0  0  0   15  0 15
+ 0  0  0    0 15  7    0  0  0    0  0  0
+ 0  0  0    0  0  0    0 15  7    0  0  0
+15  0 15    0  0  0    0  0  0    0  0  0</code></pre><p><img src="http://img.alicdn.com/tfs/TB17WH3dv1H3KVjSZFBXXbSMXXa-120-120.png" alt=""></p>
+</blockquote>
+<p>总结一下各个变量的含义：</p>
+<ol>
+<li><code>w</code> 和 <code>h</code>：宽度和高度像素数。</li>
+<li><code>samps</code>：每个像素采样次数的 1/4。</li>
+<li><code>cam</code>：相机描述。</li>
+<li><code>cx</code> 和 <code>cy</code>：长度与幕布真实尺寸相同的水平、垂直矢量。</li>
+<li><code>c</code>：按像素存储渲染结果的数组。</li>
+</ol>
+<h3 id="子像素采样">子像素采样</h3>
+<p>接下来，我们看一下如何计算每个像素的值的（即之前省略的部分）。对每一个像素，都将其拆分为 2x2 一共 4 个子像素。一个当然的想法是，以子像素的中心点 $P_s$ 作为射线的出发点开始追踪，但是由于每个子像素都会进行 <code>samps</code> 次光追取均值，所以这里就引入了一次随机过程：以子像素的中心点，在一个像素大小的范围内进行一次随机采样，并以采样到的点 $P_i$ 为射线的出发点，进行一次光追。对每个子像素完成 <code>samps</code> 次光追，依次以 $P_1$，$P_2$ ……为出发点，最后求均值。</p>
+<p><img src="https://img.alicdn.com/tfs/TB1QR3EdBCw3KVjSZR0XXbcUpXa-214-214.png" alt=""></p>
+<p>而且，为了使渲染的质量更高一些（达到相同渲染质量所需的采样次数更小一些），这里对随机过程进行了优化：对随机数进行了一次 <a href="https://computergraphics.stackexchange.com/questions/3868/why-use-a-tent-filter-in-path-tracing">tent 滤波</a>。此滤波函数将 $x$ 从 $[0,2]$ 区间映射到了 $[-1, 1]$，当 $x$ 为随机的值时，$f(x)$ 的分布更向中点值 $0$ 集中（从图中可以看出）。</p>
+<p>\begin{equation}f(x) = \left \{ \begin{matrix} \sqrt{x-1} -1 \leftarrow x&lt;1 \\ 1-\sqrt{2-x} \leftarrow x&gt;1 \end{matrix} \right. \end{equation}</p>
+<p><img src="https://img.alicdn.com/tfs/TB18tZDdxiH3KVjSZPfXXXBiVXa-242-266.png" alt=""></p>
+<p>然后，拿到经过滤波后的随机数 $dx$，$dy$，计算 $P_i$ 在整个画布中的归一化坐标（假设成为 $n_x$ 和 $n_y$，如 <code>nx=(sx+0.5+dx)/2+x)/w-0.5</code>），再乘以之前求得的画布真实尺寸矢量 $cx$ 和 $cy$，加上相机本身的方向矢量 $d$，就得到了最终从相机原点射向 $P_i$ 的矢量 $D$，即代码中的 <code>d</code>。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1uz3Hdq5s3KVjSZFNXXcD3FXa-231-277.png" alt=""></p>
+<pre><code class="language-cpp"><span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> sy=<span class="hljs-number">0</span>, i=(h-y<span class="hljs-number">-1</span>)*w+x; sy&lt;<span class="hljs-number">2</span>; sy++)     <span class="hljs-comment">// 2x2 subpixel rows</span>
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> sx=<span class="hljs-number">0</span>; sx&lt;<span class="hljs-number">2</span>; sx++, r=Vec()){        <span class="hljs-comment">// 2x2 subpixel cols</span>
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">int</span> s=<span class="hljs-number">0</span>; s&lt;samps; s++){
+            <span class="hljs-keyword">double</span> r1=<span class="hljs-number">2</span>*erand48(Xi), dx=r1&lt;<span class="hljs-number">1</span> ? <span class="hljs-built_in">sqrt</span>(r1)<span class="hljs-number">-1</span>: <span class="hljs-number">1</span>-<span class="hljs-built_in">sqrt</span>(<span class="hljs-number">2</span>-r1);
+            <span class="hljs-keyword">double</span> r2=<span class="hljs-number">2</span>*erand48(Xi), dy=r2&lt;<span class="hljs-number">1</span> ? <span class="hljs-built_in">sqrt</span>(r2)<span class="hljs-number">-1</span>: <span class="hljs-number">1</span>-<span class="hljs-built_in">sqrt</span>(<span class="hljs-number">2</span>-r2);
+            Vec d = cx*( ( (sx+<span class="hljs-number">.5</span> + dx)/<span class="hljs-number">2</span> + x)/w - <span class="hljs-number">.5</span>) +
+            cy*( ( (sy+<span class="hljs-number">.5</span> + dy)/<span class="hljs-number">2</span> + y)/h - <span class="hljs-number">.5</span>) + cam.d;
+            r = r + radiance(Ray(cam.o+d*<span class="hljs-number">140</span>,d.norm()),<span class="hljs-number">0</span>,Xi)*(<span class="hljs-number">1.</span>/samps);
+        } <span class="hljs-comment">// Camera rays are pushed ^^^^^ forward to start in interior</span>
+        c[i] = c[i] + Vec(clamp(r.x),clamp(r.y),clamp(r.z))*<span class="hljs-number">.25</span>;
+    }</code></pre>
+<p>最后，调用 <code>radiance</code>，沿着穿过此子像素的射线，在 140 倍远（让光追的开始点进到盒子里面，而不会直接被朝前的表面挡掉）的地方开始进行光线追踪算法。进行 <code>samps</code> 次，取均值，再基于 4 个子像素再取一次均值，就得到了这个像素的颜色。</p>
+<blockquote>
+<p>erand48() 函数是 C 标准库提供的随机函数。传入长度为 3 的数组作为随机种子，返回 [0, 1] 区间的双精度浮点数，同时改写传入的随机种子，便于下一次调用 erand() 时传入（以获取一个不同的结果）。</p>
+</blockquote>
+<p>总结一下各个变量的含义：</p>
+<ul>
+<li><code>i</code>：为当前像素在 <code>c</code> 中的索引。</li>
+<li><code>r</code>：通过光追计算出的子像素的颜色。</li>
+<li><code>sx</code> 和 <code>sy</code>：子像素索引，为 0 或 1。</li>
+<li><code>r1</code> 和 <code>r2</code>：滤波用自变量，在 [0, 2] 区间随机取得。</li>
+<li><code>dx</code> 和 <code>dy</code>：滤波后的随机自变量，分布在 [-1, 1] 区间内。</li>
+<li><code>d</code> ：从相机原点指向子像素位置的矢量。</li>
+</ul>
+<h2 id="光线追踪">光线追踪</h2>
+<p>讲了这么多，终于到正餐了。函数 <code>radiance()</code> 即进行了一次光线追踪。</p>
+<pre><code class="language-c">Vec radiance(const Ray &amp;r, int depth, unsigned short *Xi){
+    double t;                               // distance to intersection
+    int id=0;                               // id of intersected object
+    if (!intersect(r, t, id)) return Vec(); // if miss, return black
+    const Sphere &amp;obj = spheres[id];        // the hit object
+    Vec x=r.o+r.d*t, n=(x-obj.p).norm(), nl=n.dot(r.d)&lt;0?n:n*-1, f=obj.c;
+    double p = f.x&gt;f.y &amp;&amp; f.x&gt;f.z ? f.x : f.y&gt;f.z ? f.y : f.z; // max refl
+    if (++depth&gt;5) if (erand48(Xi)&lt;p) f=f*(1/p); else return obj.e; //R.R.
+    if (obj.refl == DIFF){                  // Ideal DIFFUSE reflection
+      // ...
+    } else if (obj.refl == SPEC)            // Ideal SPECULAR reflection
+      // ...
+    // ...                                   // Ideal dielectric REFRACTION
+}</code></pre>
+<p>函数 <code>radiance()</code> 接收三个参数，射线 <code>r</code>，深度 <code>depth</code> 和随机种子 <code>Xi</code>。此函数是一个递归函数，在计算射线颜色时候，遇到反射或折射，会计算出下一次反射或折射的射线，然后递归调用自己求算下一次射线的颜色。深度 <code>depth</code> 标记了反射/折射的次数。</p>
+<p>下面看 <code>radiance()</code> 函数的逻辑：</p>
+<h3 id="求取交点和递归结束条件">求取交点和递归结束条件</h3>
+<p>首先，对场景中的所有球体对象，尝试求取射线与之交点。函数 <code>intersect()</code> 负责做这件事：遍历 <code>speheres</code> 数组，依次调用 <code>sphere</code> 对象上的 <code>intersect()</code> 方法，并保留最小的正值 <code>t</code> 和对应球体在 <code>spheres</code> 数组中的索引 <code>i</code>。</p>
+<pre><code class="language-c">inline bool intersect(const Ray &amp;r, double &amp;t, int &amp;id){
+    double n=sizeof(spheres) /sizeof(Sphere), d, inf=t=1e20;
+    for(int i=int(n);i--;) if((d=spheres[i].intersect(r))&amp;&amp;d&lt;t){t=d;id=i;}
+    return t&lt;inf;
+}</code></pre>
+<p>如果没有任何对象与之相交，直接返回黑色（递归的结束条件 1）。</p>
+<p>如果检测到有球体与射线相交，首先检查当前深度是否大于了 5（之前已经经过了 5 次反射或折射），如果是，那么遵循一个概率来随机地决定采取以下哪一种方案：</p>
+<ol>
+<li>放弃反射光的贡献，直接返回物体的出射光——虽然大部分时候是 0（递归的结束条件 2）。</li>
+<li>继续追踪光线。</li>
+</ol>
+<p>这个概率就是当前物体表面的颜色 RGB 分量中最大的那个分量，归一化后的值。换言之，物体越暗（的颜色值越低），越容易被筛选到第 1 种方案（因为物体暗，环境光反射贡献的值也会小），而物体越亮，越容易被筛选到第二种方案。值得注意的是，当选择第二种方案时，需要把物体的颜色按照概率调高一些 <code>f=f*(1/p)</code>，这是因为那些运气不够好，被筛选到 1 方案光线，其反射分量完全地消失了，这会导致最终计算出的颜色的期望（也就是说，即使采样无穷次）与真实值产生偏差。在运气好的 2 方案中调整颜色，可以消除这个偏差。</p>
+<blockquote>
+<p>按照概率进行随机选择是无处不在的，只要采样的次数足够多，那么遵照概率选择计算得到的均值就能够逼近真实值。</p>
+</blockquote>
+<p>接着，如果深度小于等于 5，那么不管物体的颜色值如何，都会正常地递归地进行光线追踪。在此之前，还需要预先求取一些变量的值，比如法线 <code>nl</code> 等，便于后续使用。</p>
+<p>总结一下各变量的意义：</p>
+<ul>
+<li><code>t</code>：交点距离相机原点的距离。</li>
+<li><code>id</code>：相交的球体在 <code>spheres</code> 数组中的索引。</li>
+<li><code>obj</code>：相交的球体 <code>Sphere</code> 对象。</li>
+<li><code>x</code>：交点的位置。</li>
+<li><code>n</code>：球体在交点处的归一化的法线（从球心射向表面）。</li>
+<li><code>nl</code>：与反射/折射上下文契合的归一化的法线：如果射线在球体外部，<code>nl</code> 与 <code>n</code> 相同；如果射线在球体内部（折射），<code>nl</code> 与 <code>n</code> 相反。</li>
+</ul>
+<h3 id="散射（漫反射）">散射（漫反射）</h3>
+<p>追踪光线，当代表光线的射线与球体相交时，根据球体表面的特性，进行不同的操作（代码中省略的部分）。</p>
+<p>如果物体表面是漫反射，将随机选取一个角度取归一化的反射光线 $D$：</p>
+<ol>
+<li>确定互相正交的三个归一化矢量 $U$，$V$ 和 $W$，其中 $W$ 为反射面的法线。</li>
+<li>在区间 $[0, 1]$ 中随机确定一个值 $r_2$，并使 $\sqrt{1-r_2^2}$ 作为反射光线 $D$ 在法线 $W$ 方向上投影的长度，使 $\sqrt{r_2}$ 也就是 $r_2 s$ 成为反射光线在表面上投影的长度。</li>
+<li>在区间 $[0, 2\pi]$ 中随机确定一个角度值 $r1$，使之成为反射光点 $D$ 在反射表面（即 $UV$ 平面）的投影与 $U$ 轴的交角。</li>
+<li>极坐标公式转笛卡尔坐标，$U\ast\cos(r_1)\ast r_2s+V\ast\sin(r_1)\ast r_2s+W\ast \sqrt{1-r_2s^2}$ 计算出在半球面的随机矢量，再归一化得到反射矢量 $D$。</li>
+</ol>
+<p><img src="http://img.alicdn.com/tfs/TB1BAN1dROD3KVjSZFFXXcn9pXa-196-218.png" alt=""></p>
+<p>最后，递归地调用 <code>radiance()</code> 函数，将反射光线作为参数传入，传入已自增过一次的深度和随机种子。其结果乘以表面的颜色，再加上球体表面的发射光颜色，作为结果返回。这就是此光追算法对散射表面的处理。</p>
+<pre><code class="language-c">if (obj.refl == DIFF){                  // Ideal DIFFUSE reflection
+    double r1=2*M_PI*erand48(Xi), r2=erand48(Xi), r2s=sqrt(r2);
+    Vec w=nl, u=((fabs(w.x)&gt;.1?Vec(0,1):Vec(1))%w).norm(), v=w%u;
+    Vec d = (u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1-r2)).norm();
+    return obj.e + f.mult(radiance(Ray(x,d),depth,Xi));</code></pre>
+<p>总结一下各变量的含义：</p>
+<ul>
+<li><code>u</code>，<code>v</code>，<code>w</code>：互相正交的三个归一化矢量，<code>w</code> 即为法向量。</li>
+<li><code>r1</code>：反射光线在反射表面与 <code>u</code> 的交角。</li>
+<li><code>r2</code> 与 <code>r2s</code>：<code>r2s</code> 为反射光线在反射表面投影的长度，<code>r2</code> 为此值的平方。</li>
+<li><code>d</code>：随机求取的反射方向。</li>
+</ul>
+<h3 id="镜面反射">镜面反射</h3>
+<p>镜面反射比较简单，因为对于确定的入射光线，反射的方向也是确定的，因此没有随机过程，直接取镜面反射的方向继续进行光追。</p>
+<p>镜面反射的求法比较简单，不过也记录一下吧：如下图对称的两条射线 $D_1$ 和 $D_2$，而法线为 $N$（法线是归一化的）。此时有 $D_1+D_2=N\ast 2(N\cdot D_1)$，求解 $D_2=N\ast 2(N\cdot D_1)-D_1$ 。在代码中，$D_1$ 就是 <code>-r.d</code>，带入得到 <code>r.d-n*2*n.dot(r.d)</code>，即反射光线的。由于 <code>r.d</code> 也已经是归一化的了，所以求取得到的结果也一定是归一化的。</p>
+<p><img src="http://img.alicdn.com/tfs/TB1ich6dUGF3KVjSZFoXXbmpFXa-376-183.png" alt=""></p>
+<p>代码如下：</p>
+<pre><code class="language-c">} else if (obj.refl == SPEC)            // Ideal SPECULAR reflection
+    return obj.e + f.mult(radiance(Ray(x,r.d-n*2*n.dot(r.d)),depth,Xi));</code></pre>
+<h3 id="折射">折射</h3>
+<p>折射是比较复杂的。不同的物体有不同的折射率，空气的折射率为 1，玻璃的折射率为 1.5。根据折射定理：光线从折射率为 $n_1$ 的介质折射到折射率为 $n_2$ 的介质，折射角满足（此定理可以从更一般的麦克斯韦电磁方程组推导出来，厉害厉害）：</p>
+<p>\begin{equation}n_1\sin \theta_1 = n_2 \sin \theta_2\end{equation}</p>
+<p><img src="https://img.alicdn.com/tfs/TB1dI9VawFY.1VjSZFnXXcFHXXa-511-230.png" alt=""></p>
+<h4 id="全反射">全反射</h4>
+<p>首先需要考虑的是全反射现象，即光线从光密介质（玻璃）向光疏介质（空气）传播时（上图右半部分），$\theta_1$ 大于临界角（使得 $\theta_2$ 为 90° 的 $\theta_1$），以至于不存在 $\theta_2$ 满足上述折射定理时，所有光都被反射的现象，即：</p>
+<p>\begin{equation}\sin \theta_1 &gt; \frac{n_2}{n_1} \sin(90°)\end{equation}</p>
+<p>两边平方并作简单变换，得到：</p>
+<p>\begin{equation}(\frac{n_2}{n_1})^2-\cos^2 \theta_1+1&lt;0\end{equation}</p>
+<p>由于 <code>nnt</code> 为 $\frac{n_1}{n_2}$，而 <code>ddn</code> 为 $-\cos \theta_1$，代入上式，得到全反射的条件即是 <code>1-nnt*nnt*(1-ddn*ddn))&lt;0</code>。满足全反射条件时，镜面反射的方式进行处理。</p>
+<pre><code class="language-c">Ray reflRay(x, r.d-n*2*n.dot(r.d));     // Ideal dielectric REFRACTION
+bool into = n.dot(nl)&gt;0;                // Ray from outside going in?
+double nc=1, nt=1.5, nnt=into?nc/nt:nt/nc, ddn=r.d.dot(nl), cos2t;
+if ((cos2t=1-nnt*nnt*(1-ddn*ddn))&lt;0)    // Total internal reflection
+    return obj.e + f.mult(radiance(reflRay,depth,Xi));</code></pre>
+<p>总结一下各变量的含义：</p>
+<ul>
+<li><code>reflRay</code>：镜面反射方向，与上一节中的求法完全一致。</li>
+<li><code>into</code>：由空气（试图）进入玻璃则为 <code>true</code>，由玻璃（试图）进入空气则为 <code>false</code>。</li>
+<li><code>nc</code> 和 <code>nt</code>：空气和玻璃的折射率。</li>
+<li><code>nnt</code> 为折射率比值，当追踪的射线是从空气进入玻璃时，<code>nnt</code> 为 <code>1.0/1.5</code>，当射线是从玻璃进入空气时，<code>nnt</code> 为 <code>1.5</code>。</li>
+<li><code>ddn</code>：即 $-\cos \theta_1$ 的值，由 $D$ 和 $N$ 点乘而来。</li>
+</ul>
+<h4 id="正常折射">正常折射</h4>
+<p>所谓正常折射，即是光线一部分镜面反射，一部分折射进入另一种介质。此时，我们需要：</p>
+<ol>
+<li>计算折射光线矢量 $T$。</li>
+<li>计算有多少比例的光线被反射，有多少比例的光线被折射。</li>
+<li>根据条件，选择以随机或非随机的形式，递归地进行光线追踪。</li>
+</ol>
+<p>首先计算折射光线矢量 $T$：</p>
+<p><img src="http://img.alicdn.com/tfs/TB1SZCecAxz61VjSZFrXXXeLFXa-209-227.png" alt=""></p>
+<p>首先，假设入射光线在表面平面的投影矢量（并归一化）为 $B$ 已知，折射角 $\theta_2$ 也已知，我们可以得到 $T$ 为：</p>
+<p>\begin{equation}T=B\sin \theta_2 - N\cos \theta_2\end{equation}</p>
+<p>其中 $B$ 就是入射光线平面上的投影矢量（因为入射和折射在同一个平面内）归一化得到，而此投影矢量可以使用 $D$ 减去 $D$ 在法线上的投影 $D\cdot N$（注意这里点积是个负数）来得出，因此：</p>
+<p>\begin{equation}B=\frac{D-N\ast (D\cdot N)}{\sqrt{1-(D\cdot N)^2}}\end{equation}</p>
+<p>同时 $\theta_2$ 的正弦和余弦值也可以通过折射定律求得：</p>
+<p>\begin{equation}\sin \theta_2 = \frac{n_1}{n_2} \sin \theta_1 = \frac{n_1}{n_2}  \sqrt{  1-(D\cdot N)^2}\end{equation}</p>
+<p>\begin{equation}\cos \theta_2 = \sqrt{1-\sin^2\theta_2} = \sqrt{1-\frac{n_1^2}{n_2^2}(1-(D\cdot N)^2)}\end{equation}</p>
+<p>全部代入，可得：</p>
+<p>\begin{equation}T=\frac{n_1(D+N(D\cdot N))}{n_2}-N \sqrt{1-\frac{n_1^2(1-(D\cdot N)^2)}{n_2^2}}\end{equation}</p>
+<p>按照上述公式，将变量代入，即可计算出折射光线归一化矢量 <code>tdir</code>：</p>
+<pre><code class="language-c">Vec tdir = (r.d*nnt - n*((into?1:-1)*(ddn*nnt+sqrt(cos2t)))).norm();</code></pre>
+<p>接下来，计算有多少比例的光线被反射，有多少比例的光线被折射。根据电动力学的一些理论，入射光线（普通的非偏振光）被反射/折射的比例，与入射角 $\theta_1$，两种介质的折射率都有关系。当入射角等于 0（即垂直入射到表面）时，被反射的比例 $R_0$ 为：</p>
+<p>\begin{equation}R_0=(\frac{n_1-n_2}{n_1+n_2})^2\end{equation}</p>
+<p>而当入射角为 $\theta$ 时的反射比例 $R_\theta$ 为：</p>
+<p>\begin{equation}R_\theta=R_0+(1-R_0)(1-\cos \theta_1)^5\end{equation}</p>
+<p>最后，基于当前光追的深度：</p>
+<ol>
+<li>如果深度小于等于 2，那么分别递归地追踪反射光和折射光，将两者对颜色的贡献再加上物体本身的发光，作为结果返回。</li>
+<li>如果深度大于 2，那么依据折射和反射光线的占比来进行概率随机，选择追踪反射光或折射光中的一支。换言之，如果反射光占比高，那么就有较大的可能性随机到反射光线，反之亦然。注意，这时由于我们放弃了另一种可能性，会导致结果的期望产生偏差，所以需要进行一次修正。</li>
+</ol>
+<p>对玻璃材质，前几次反射、折射对最终的结果的贡献比较大，所以选择都进行追踪。但是这样做一下子使得某些追踪的采样次数发散为了原来的 4 倍，如果深度改为 4，可能就是 16 倍。所以代码把发散深度限制在 2 这样一个比较小的数值，也算是在效果和性能间达到一个平衡。</p>
+<p>代码如下：</p>
+<pre><code class="language-c">double a=nt-nc, b=nt+nc, R0=a*a/(b*b), c = 1-(into?-ddn:tdir.dot(n));
+double Re=R0+(1-R0)*c*c*c*c*c,Tr=1-Re,P=.25+.5*Re,RP=Re/P,TP=Tr/(1-P);
+return obj.e + f.mult(depth&gt;2 ? (erand48(Xi)&lt;P ?   // Russian roulette
+    radiance(reflRay,depth,Xi)*RP : radiance(Ray(x,tdir),depth,Xi)*TP) :
+    radiance(reflRay,depth,Xi)*Re+radiance(Ray(x,tdir),depth,Xi)*Tr);</code></pre>
+<p>最后解释一下各个变量的含义：</p>
+<ul>
+<li><code>a</code> 和 <code>b</code>：用以计算 $R_0$ 的临时变量。</li>
+<li><code>R0</code>：入射角为 0 时反射光的占比。</li>
+<li><code>c</code>：即 $1-\cos \theta_1$。</li>
+<li><code>Re</code>：当前入射角下反射光的占比。</li>
+<li><code>Tr</code>：折射光的占比。</li>
+<li><code>RP</code>：随机到反射光时，对结果的修正的因子。</li>
+<li><code>TP</code>：随机到折射光时，对结果的修正的因子。</li>
+</ul>
+<p>这样，光追算法就全部完成了。</p>
+<h2 id="感想">感想</h2>
+<p>一直觉得光线追踪是非常高端的存在，因为没有基础，想了解也不知从何看起。一个偶然的机会发现到这个 demo，觉得挺有意思，就拿过来研究了。结果发现看起来还是比较吃力，好在另外一个老外的解读 PPT 帮了很大的忙。</p>
+<p>把学习过的东西消化了，再重新写出来是件很折磨的事情，但收获也不小。每一个公式一步一步推导过来，对一些地方「为什么这么做」也有了不一样的体会。数学还是挺重要的，而且能够给人带来很强的成就感。</p>
+]]></description>
+            <link>http://xieguanglei.github.io/blog/post/ray-tracing-99-lines-code.html</link>
+            <guid isPermaLink="false">ray-tracing-99-lines-code</guid>
+            <dc:creator><![CDATA[谢光磊]]></dc:creator>
+            <pubDate>Sat, 22 Jun 2019 00:00:00 GMT</pubDate>
+        </item>
+    </channel>
+</rss>
